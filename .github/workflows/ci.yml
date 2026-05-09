@@ -4,7 +4,7 @@ on: [push]
 
 env: 
   IMAGE_NAME: ndubuisip/demo-app
-  IMAGE_TAG: juice-shop-1.0 
+  IMAGE_TAG: juice-shop-1.1
 
 jobs:
   create_cache:
