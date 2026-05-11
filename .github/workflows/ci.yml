@@ -33,6 +33,8 @@ jobs:
             .yarn
           key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
       - run: yarn install
+      - run: yarn test
+
   gitleaks:
     runs-on: ubuntu-latest
     container: 
