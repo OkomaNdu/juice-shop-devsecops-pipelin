@@ -4,7 +4,7 @@ on: [push]
 
 env: 
   IMAGE_NAME: ndubuisip/demo-app
-  IMAGE_TAG: juice-shop-1.1
+  IMAGE_TAG: juice-shop-1.2
 
 jobs:
   create_cache:
@@ -32,8 +32,17 @@ jobs:
             node_modules
             .yarn
           key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
-      - run: yarn install
-      - run: yarn test
+      - run: yarn instal
+  gitleaks:
+    runs-on: ubuntu-latest
+    container: 
+      image: zricethezav/gitleaks:latest
+      options: --entrypoint ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: gitleaks detect --source . --verbose
 
   build_image:
     runs-on: ubuntu-latest
