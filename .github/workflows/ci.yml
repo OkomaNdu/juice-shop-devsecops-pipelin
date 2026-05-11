@@ -32,7 +32,7 @@ jobs:
             node_modules
             .yarn
           key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
-      - run: yarn instal
+      - run: yarn install
   gitleaks:
     runs-on: ubuntu-latest
     container: 
