@@ -50,6 +50,7 @@ jobs:
 
   njsscan:
     runs-on: ubuntu-latest
+    continue-on-error: true
     permissions:
       security-events: write
     steps:
@@ -59,11 +60,21 @@ jobs:
         id: njsscan
         uses: ajinabraham/njsscan-action@master
         with:
-          args: '. --sarif --output results.sarif || true'
+          args: '. --sarif --output results.sarif --exit-warning'
       - name: Upload njsscan report
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
+
+  semgrep:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container: semgrep/semgrep
+    env:
+      SEMGREP_RULES: p/javascript
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep ci        
 
   build_image:
     runs-on: ubuntu-latest
