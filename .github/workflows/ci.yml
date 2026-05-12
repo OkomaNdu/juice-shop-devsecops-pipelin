@@ -48,6 +48,14 @@ jobs:
       - run: git config --global --add safe.directory $GITHUB_WORKSPACE
       - run: gitleaks detect --source . --verbose
 
+  njsscan:
+    runs-on: ubuntu-latest
+    container: python:3.11
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip3 install --upgrade njsscan
+      - run: njsscan .
+
   build_image:
     runs-on: ubuntu-latest
     needs: [yarn_test, gitleaks]
