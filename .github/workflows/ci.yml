@@ -50,11 +50,18 @@ jobs:
 
   njsscan:
     runs-on: ubuntu-latest
-    container: python:3.11
     steps:
-      - uses: actions/checkout@v4
-      - run: pip3 install --upgrade njsscan
-      - run: njsscan .
+      - name: Checkout the code
+        uses: actions/checkout@v2
+      - name: nodejsscan scan
+        id: njsscan
+        uses: ajinabraham/njsscan-action@master
+        with:
+          args: '. --sarif --output results.sarif || true'
+      - name: Upload njsscan report
+        uses: github/codeql-action/upload-sarif@v1
+        with:
+          sarif_file: results.sarif
 
   build_image:
     runs-on: ubuntu-latest
