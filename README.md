@@ -38,6 +38,7 @@ For a detailed introduction, full list of features and architecture overview ple
 
 ## Table of contents
 
+- [CI Pipeline](#ci-pipeline)
 - [Setup](#setup)
     - [From Sources](#from-sources)
     - [Packaged Distributions](#packaged-distributions)
@@ -59,6 +60,44 @@ For a detailed introduction, full list of features and architecture overview ple
 - [Donations](#donations)
 - [Contributors](#contributors)
 - [Licensing](#licensing)
+
+## CI Pipeline
+
+This project uses a CI pipeline implemented with [GitHub Actions](https://github.com/features/actions). The pipeline triggers on every `git push` and enforces a gate: the Docker image is only built and published if all tests pass.
+
+### Pipeline Overview
+
+```
+git push
+    │
+    └── yarn_test          ← Install deps & run test suite (Node.js 18)
+            │
+            └── build_image  ← Docker build & push to Docker Hub
+                              (only runs if yarn_test passes)
+```
+
+### Jobs
+
+| Job | Runtime | What it does |
+|---|---|---|
+| `yarn_test` | `node:18-bullseye` | Runs `yarn install` then `yarn test` |
+| `build_image` | `docker:24` (DinD) | Builds Docker image and pushes `ndubuisip/demo-app:juice-shop-1.3` to Docker Hub |
+
+### Why This CI Process Matters
+
+**1. Tests as a Quality Gate**
+`build_image` has a hard `needs: yarn_test` dependency. A failing test blocks the image from being built or published — broken code cannot reach the registry.
+
+**2. Consistent, Reproducible Builds**
+Every job runs inside a clean containerized environment (`node:18-bullseye`, `docker:24`). This eliminates environment drift and ensures builds are identical regardless of who pushes.
+
+**3. Automated Container Delivery**
+On a successful run, a tested Docker image is automatically pushed to Docker Hub, removing manual steps and human error from the release process.
+
+**4. Auditability**
+Every pipeline run is logged in GitHub Actions with a full history of what passed, what failed, and when — giving a clear audit trail per commit.
+
+---
 
 ## Setup
 
