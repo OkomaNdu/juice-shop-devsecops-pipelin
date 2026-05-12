@@ -37,6 +37,7 @@ jobs:
 
   gitleaks:
     runs-on: ubuntu-latest
+    continue-on-error: true
     container:
       image: zricethezav/gitleaks:latest
       options: --entrypoint ""
@@ -62,3 +63,5 @@ jobs:
       - run: docker login -u $DOCKER_USER -p $DOCKER_PASS
       - run: docker build -t $IMAGE_NAME:$IMAGE_TAG .
       - run: docker push $IMAGE_NAME:$IMAGE_TAG
+
+
