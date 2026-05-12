@@ -76,6 +76,8 @@ git push
                               (only runs if yarn_test passes)
 ```
 
+![CI Pipeline Run](screenshots/ci-pipeline.png)
+
 ### Jobs
 
 | Job | Runtime | What it does |
