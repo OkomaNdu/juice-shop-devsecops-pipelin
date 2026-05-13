@@ -59,8 +59,6 @@ jobs:
 
   njsscan:
     runs-on: ubuntu-latest
-    permissions:
-      security-events: write
     steps:
       - name: Checkout the code
         uses: actions/checkout@v4
@@ -68,11 +66,7 @@ jobs:
         id: njsscan
         uses: ajinabraham/njsscan-action@master
         with:
-          args: '. --sarif --output results.sarif --exit-warning'
-      - name: Upload njsscan report
-        uses: github/codeql-action/upload-sarif@v4        # updated from v3
-        with:
-          sarif_file: results.sarif
+          args: '. --exit-warning'
 
   semgrep:
     runs-on: ubuntu-latest
