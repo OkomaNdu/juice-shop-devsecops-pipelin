@@ -64,54 +64,70 @@ For a detailed introduction, full list of features and architecture overview ple
 
 ## CI Pipeline
 
-This project implements a **DevSecOps CI pipeline** using [GitHub Actions](https://github.com/features/actions), embedding security controls directly into the software delivery process. The pipeline is triggered on every `git push` and orchestrates six jobs across two stages — a parallel security and test stage, followed by a gated image delivery stage. No Docker image is built or published unless all upstream jobs complete successfully.
+This project implements a **DevSecOps CI pipeline** using [GitHub Actions](https://github.com/features/actions), integrating automated security controls directly into the software delivery lifecycle. The pipeline is triggered on every `git push` and orchestrates six jobs across two execution stages:
 
-### Pipeline Overview
+- **Stage 1 — Parallel security scanning and test execution:** `create_cache`, `yarn_test`, `gitleaks`, `njsscan`, and `semgrep` run concurrently, maximising feedback speed.
+- **Stage 2 — Gated image delivery:** `build_image` executes only after all Stage 1 jobs complete, ensuring no artefact is published without passing security validation and functional testing.
+
+### Pipeline Architecture
 
 ```
 git push
     │
-    ├── create_cache    ← Dependency installation & caching (node_modules / .yarn)
+    ├── create_cache    ← Installs and caches dependencies (node_modules / .yarn)
     │       │
-    │   yarn_test       ← Unit test execution (needs create_cache)
+    │   yarn_test       ← Restores cache and executes unit test suite
     │       │
-    ├── gitleaks        ← Secret scanning across full git history (continue-on-error)
-    ├── njsscan         ← SAST: Node.js vulnerability analysis, results uploaded as SARIF
-    ├── semgrep         ← SAST: Multi-language static analysis
+    ├── gitleaks        ← Scans full git history for secrets; outputs SARIF (continue-on-error)
+    ├── njsscan         ← Node.js SAST; uploads findings to GitHub Code Scanning via SARIF
+    ├── semgrep         ← Multi-language SAST using p/javascript ruleset (continue-on-error)
     │       │
-    └───────┴── build_image  ← Docker build & push (needs yarn_test + gitleaks + njsscan + semgrep)
+    └───────┴── build_image  ← Docker build & push to registry (needs: all above)
 ```
 
 ![CI Pipeline Run](screenshots/sast-ci-pipeline.png)
 
-### Jobs
+### Job Reference
 
-| Job | Runtime | What it does |
-|---|---|---|
-| `create_cache` | `node:18-bullseye` | Runs `yarn install` and caches `node_modules` and `.yarn` keyed to the `yarn.lock` hash to accelerate downstream jobs |
-| `yarn_test` | `node:18-bullseye` | Restores the dependency cache and executes the full test suite via `yarn test` |
-| `gitleaks` | `zricethezav/gitleaks:latest` | Scans the complete git history for hardcoded secrets and credentials (`continue-on-error: true`) |
-| `njsscan` | `ajinabraham/njsscan-action@master` | Performs Node.js-specific SAST, outputs findings in SARIF format and uploads results to GitHub Code Scanning |
-| `semgrep` | `semgrep/semgrep` | Runs multi-language static analysis via `semgrep ci` against configured rulesets |
-| `build_image` | `docker:24` (DinD) | Builds the Docker image and pushes `ndubuisip/demo-app:juice-shop-1.2` to Docker Hub only after all upstream jobs complete |
+| Job | Container / Action | Trigger Condition | Output |
+|---|---|---|---|
+| `create_cache` | `node:18-bullseye` | On every push | Cached `node_modules` / `.yarn` keyed to `yarn.lock` hash |
+| `yarn_test` | `node:18-bullseye` | `needs: create_cache` | Test pass/fail result |
+| `gitleaks` | `zricethezav/gitleaks:latest` | On every push (`continue-on-error: true`) | `gitleaks.sarif` uploaded to GitHub Security tab |
+| `njsscan` | `ajinabraham/njsscan-action@master` | On every push | `results.sarif` uploaded to GitHub Code Scanning |
+| `semgrep` | `semgrep/semgrep` | On every push (`continue-on-error: true`) | Blocking findings logged to GitHub Actions |
+| `build_image` | `docker:24` (DinD) | `needs: [yarn_test, gitleaks, njsscan, semgrep]` | `ndubuisip/demo-app:juice-shop-1.2` pushed to Docker Hub |
 
-### Gitleaks — Secret Scanning
+---
 
-Gitleaks scans every commit in the repository history for hardcoded secrets such as API keys, passwords, and tokens. It runs in parallel with `create_cache` and does not block the pipeline due to `continue-on-error: true`, but its findings are visible in the GitHub Actions log and must be reviewed and remediated.
+### Stage 1 — Security Scanning
 
-An initial scan of this repository across 27 commits (~9.15 MB) detected **43 leaks** across multiple files, flagged under the following rule violations:
+#### Secret Detection: Gitleaks
 
-| Rule | Files affected |
+Gitleaks performs retrospective secret scanning across the full git history on every push, targeting hardcoded credentials including API keys, passwords, tokens, and private keys. The job is configured with `continue-on-error: true` to maintain pipeline continuity during active remediation, while ensuring findings remain fully visible to engineering teams.
+
+**Scan command:**
+```bash
+gitleaks detect --source . --verbose --report-format sarif --report-path gitleaks.sarif
+```
+
+Findings are serialised to SARIF and uploaded to the **GitHub Security tab** via `github/codeql-action/upload-sarif@v3` using an `if: always()` condition, guaranteeing report upload regardless of whether the scan step exits with an error.
+
+**Scan results — 37 commits scanned (~9.16 MB):**
+
+| Rule ID | Affected Files |
 |---|---|
 | `generic-api-key` | `data/static/users.yml`, `routes/login.ts`, `test/api/*`, `frontend/src/app/*` |
 | `jwt` | `test/server/verifySpec.ts`, `test/server/currentUserSpec.ts`, `test/cypress/integration/e2e/forgedJwt.spec.ts` |
 | `private-key` | `lib/insecurity.ts` |
 
-![Gitleaks Findings](screenshots/gitleaks-findings.png)
+An initial scan identified **43 leaks**. After applying allowlist configuration (see below), findings were reduced to **10 verified production secrets**.
 
-### Handling False Positives — `.gitleaks.toml`
+![Gitleaks CI Output](screenshots/gitleaks-findings.png)
 
-Many of the 43 findings were in test files (`test/`, `*.spec.ts`) which contain intentional mock credentials used for testing purposes — these are **false positives**. To suppress them, a `.gitleaks.toml` configuration file was created at the root of the repository.
+#### False Positive Suppression — `.gitleaks.toml`
+
+The majority of initial findings originated from test fixtures (`test/`, `*.spec.ts`) containing intentional mock credentials — classified as false positives. A `.gitleaks.toml` configuration file was introduced at the repository root to apply an allowlist, scoping scans to production code only.
 
 ```toml
 [extend]
@@ -121,113 +137,115 @@ useDefault = true
 paths = ['test', '.*\/test\/.*']
 ```
 
-**What this does:**
-- `useDefault = true` — extends the built-in gitleaks default ruleset
-- `paths` allowlist — excludes any file under a `test` directory from being scanned
+| Directive | Purpose |
+|---|---|
+| `useDefault = true` | Extends the built-in gitleaks ruleset without overriding default detection logic |
+| `paths` allowlist | Excludes all files within `test/` directories from secret detection |
 
-After applying the configuration, a re-scan across **29 commits (~9.15 MB)** reduced findings from **43 → 10 leaks**, isolating only real secrets in production code such as `lib/insecurity.ts` and `routes/login.ts`.
+**Result:** 43 initial findings reduced to **10 verified leaks** across 37 commits (~9.16 MB), isolating genuine secrets in `lib/insecurity.ts` and `routes/login.ts` for targeted remediation.
 
-![Gitleaks False Positive Handling](screenshots/gitleaks-false-positive.png)
+![Gitleaks False Positive Suppression](screenshots/gitleaks-false-positive.png)
 
-### SAST — Static Application Security Testing
+---
 
-Static Application Security Testing (SAST) analyses source code for security vulnerabilities without executing the application. Two complementary SAST tools run in parallel on every push, each targeting different vulnerability classes.
+#### SAST: njsscan
 
-#### njsscan
+`njsscan` is a Node.js-specific static analysis tool that identifies insecure coding patterns, dangerous API usage, and known vulnerability signatures in JavaScript and TypeScript source code.
 
-`njsscan` is a Node.js-specific SAST tool built on top of libsast and semgrep patterns. It analyses the JavaScript/TypeScript source code for insecure coding patterns, dangerous API usage, and known vulnerability signatures.
+**CI job configuration:**
+- Action: `ajinabraham/njsscan-action@master`
+- Arguments: `. --sarif --output results.sarif --exit-warning`
+- `--exit-warning` — exits non-zero on findings without causing a hard pipeline failure
+- Requires `permissions: security-events: write` to publish SARIF results
+- Findings are uploaded to **GitHub Security → Code Scanning** via `github/codeql-action/upload-sarif@v3`, providing a queryable, persistent record of vulnerabilities per commit
 
-**CI job behaviour:**
-- Uses the `ajinabraham/njsscan-action@master` GitHub Action
-- Scans the entire codebase with `--sarif --output results.sarif --exit-warning`
-- `--exit-warning` means the job exits with a warning (non-zero) on findings rather than a hard failure
-- Results are uploaded to **GitHub Code Scanning** via `github/codeql-action/upload-sarif@v3`, making findings visible in the repository's **Security → Code scanning** tab
-- Requires `permissions: security-events: write` to upload SARIF results
+![njsscan CI Output](screenshots/njsscan-results.png)
 
-![njsscan CI Results](screenshots/njsscan-results.png)
+---
 
-#### semgrep
+#### SAST: Semgrep
 
-`semgrep` is a fast, open-source static analysis engine that supports multiple languages including JavaScript, TypeScript, Python, and more. It runs against configured rulesets to detect security anti-patterns, misconfigurations, and OWASP Top 10 vulnerabilities.
+`semgrep` is an open-source, multi-language static analysis engine that applies community and custom rulesets to detect security anti-patterns, OWASP Top 10 vulnerabilities, and insecure configurations across JavaScript and TypeScript codebases.
 
-**CI job behaviour:**
-- Runs inside the official `semgrep/semgrep` container
-- Executes `semgrep ci` which applies the configured ruleset
-- Non-blocking by default — the job succeeds even when findings exist unless `--no-suppress-errors` is passed
-- Findings are reported in the GitHub Actions log for developer review
+**CI job configuration:**
+- Container: `semgrep/semgrep`
+- Ruleset: `SEMGREP_RULES: p/javascript` (community ruleset)
+- Command: `semgrep ci`
+- `continue-on-error: true` — pipeline proceeds to `build_image` regardless of findings, maintaining delivery velocity while findings are triaged
 
-![semgrep CI Results](screenshots/semgrep-results.png)
+**Scan results — latest CI run:**
 
-### Pre-Commit Hook — Local Secret Scanning
+| Language | Rules Applied | Files Scanned | Ruleset Origin |
+|---|---|---|---|
+| TypeScript (`ts`) | 74 | 401 | Community |
+| JavaScript (`js`) | 68 | 4 | Community |
 
-To catch secrets **before** they are committed and pushed to the remote repository, a git pre-commit hook runs gitleaks locally on every `git commit`.
+Semgrep scanned **822 files** using **74 active rules** and reported **23 blocking findings**. Critical findings include SQL injection vulnerabilities in `data/static/codefixes/dbSchemaChallenge_1.ts`, flagged by the `javascript.sequelize.security.audit.sequelize-injection-express` rule — indicating user-controlled input passed directly to Sequelize ORM queries without parameterisation.
 
-#### How It Works
+![Semgrep CI Output](screenshots/semgrep-results.png)
+
+![Semgrep Summary Results](screenshots/semgrep-summary-results.png)
+
+---
+
+### Stage 2 — Pre-Commit Secret Scanning (Local Defence Layer)
+
+To intercept secrets **before** they enter the git history, a git pre-commit hook executes gitleaks locally on every `git commit`. This represents the earliest possible enforcement point in the development workflow — upstream of the CI pipeline — where remediation is least costly.
+
+#### Execution Flow
 
 ```
 git commit
     │
-    └── .git/hooks/pre-commit  ← runs automatically before the commit is recorded
+    └── .git/hooks/pre-commit       ← executes automatically prior to commit recording
             │
-            ├── docker pull zricethezav/gitleaks:latest
-            └── docker run gitleaks detect --source="/path" --verbose
+            ├── Pull latest gitleaks image
+            └── Run gitleaks detect --source="/path" --verbose
                     │
-                    ├── leaks found  → commit is blocked (exit code 1)
-                    └── no leaks     → commit proceeds
+                    ├── Secrets detected  → exit code 1 — commit is blocked
+                    └── No secrets found  → commit proceeds normally
 ```
 
-#### Setup
+#### Setup Instructions
 
-1. Create the hook file:
+**Step 1 — Create the hook file:**
 ```bash
 vim .git/hooks/pre-commit
 ```
 
-2. Add the following content:
+**Step 2 — Add the following script:**
 ```bash
 docker pull zricethezav/gitleaks:latest
 export path_to_host_folder_to_scan=/home/ndu/DevSecOps/juice-shop
 docker run -v ${path_to_host_folder_to_scan}:/path zricethezav/gitleaks:latest detect --source="/path" --verbose
 ```
 
-3. Make it executable:
+**Step 3 — Grant execute permission:**
 ```bash
 chmod +x .git/hooks/pre-commit
 ```
 
-#### Why This Matters
+#### Security Control Layering
 
-The pre-commit hook acts as the **first line of defence** — stopping secrets from ever entering the git history. This is earlier and cheaper than catching them in the CI pipeline, since secrets in git history require a full history rewrite to fully remove.
-
-| Layer | Where | Blocks commit? |
+| Control Layer | Enforcement Point | Blocks on Detection? |
 |---|---|---|
-| Pre-commit hook | Local machine, before `git commit` | Yes (exit code 1) |
-| CI gitleaks job | GitHub Actions, after `git push` | No (`continue-on-error: true`) |
+| Pre-commit hook | Local — before `git commit` | Yes — exits with code 1 |
+| CI `gitleaks` job | Remote — after `git push` | No — `continue-on-error: true` |
 
-> **Note:** `.git/hooks/` is not tracked by git. Each developer must set up the hook manually on their local machine.
+> **Operational Note:** `.git/hooks/` is not tracked by git and is not propagated via `git clone`. Each engineer must configure the hook independently on their local workstation.
 
-### Why This CI Process Matters
+---
 
-**1. Security Shifted Left**
-Security controls — secret scanning (`gitleaks`), Node.js SAST (`njsscan`), and multi-language static analysis (`semgrep`) — execute on every push, at the earliest possible point in the delivery lifecycle. Vulnerabilities are identified and surfaced to developers before code reaches production, where remediation cost is significantly higher.
+### Security Architecture Summary
 
-**2. Defence in Depth**
-No single tool catches every vulnerability class. The pipeline layers complementary controls:
-- `gitleaks` — detects hardcoded secrets and credentials in git history
-- `njsscan` — identifies Node.js-specific insecure coding patterns and dangerous API usage
-- `semgrep` — performs broad static analysis across multiple languages against security rulesets
-
-**3. Faster Builds with Dependency Caching**
-`create_cache` runs first and stores installed dependencies keyed to the `yarn.lock` hash. All downstream jobs restore from this cache, eliminating redundant installs and reducing total pipeline duration.
-
-**4. Gated Image Delivery**
-`build_image` has a hard dependency on all upstream jobs (`needs: [yarn_test, gitleaks, njsscan, semgrep]`). A Docker image is only built and published after tests pass and all security scans have completed — ensuring only verified code reaches the container registry.
-
-**5. Audit Trail and Visibility**
-`njsscan` uploads findings as SARIF to GitHub Code Scanning, providing a persistent, queryable record of security findings per commit. Every pipeline run is fully logged in GitHub Actions, creating a clear audit trail of the security posture of each release.
-
-**6. Consistent, Reproducible Environments**
-Every job executes inside a purpose-built container (`node:18-bullseye`, `docker:24`, `semgrep/semgrep`, `zricethezav/gitleaks`). This eliminates environment drift and ensures scan and build results are identical regardless of who triggers the pipeline.
+| Principle | Implementation |
+|---|---|
+| **Shift Left** | Pre-commit hook and parallel CI scans intercept vulnerabilities before code reaches production |
+| **Defence in Depth** | Three independent security tools (`gitleaks`, `njsscan`, `semgrep`) cover distinct vulnerability classes |
+| **Gated Delivery** | `build_image` is blocked until all scan and test jobs complete (`needs: [yarn_test, gitleaks, njsscan, semgrep]`) |
+| **Audit Trail** | SARIF reports from `gitleaks` and `njsscan` are uploaded to GitHub Security, providing persistent per-commit vulnerability records |
+| **Reproducibility** | All jobs execute in isolated, purpose-built containers, eliminating environment drift across pipeline runs |
+| **Build Efficiency** | Dependency caching in `create_cache` keyed to `yarn.lock` eliminates redundant installs across downstream jobs |
 
 ---
 
