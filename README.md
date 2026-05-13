@@ -39,6 +39,7 @@ For a detailed introduction, full list of features and architecture overview ple
 ## Table of contents
 
 - [CI Pipeline](#ci-pipeline)
+    - [Pre-Commit Hook](#pre-commit-hook--local-secret-scanning)
 - [Setup](#setup)
     - [From Sources](#from-sources)
     - [Packaged Distributions](#packaged-distributions)
@@ -63,46 +64,113 @@ For a detailed introduction, full list of features and architecture overview ple
 
 ## CI Pipeline
 
-This project uses a CI pipeline implemented with [GitHub Actions](https://github.com/features/actions). The pipeline triggers on every `git push` and runs three sequential jobs: dependency caching, testing, and Docker image delivery.
+This project uses a CI pipeline implemented with [GitHub Actions](https://github.com/features/actions). The pipeline triggers on every `git push` and runs four jobs — some in parallel — covering dependency caching, secret scanning, testing, and Docker image delivery.
 
 ### Pipeline Overview
 
 ```
 git push
     │
-    └── create_cache         ← Install deps & cache node_modules / .yarn
-            │
-            └── yarn_test    ← Restore cache & run test suite (Node.js 18)
-                    │
-                    └── build_image  ← Docker build & push to Docker Hub
-                                      (only runs if yarn_test passes)
+    ├── create_cache    ← Install & cache dependencies (node_modules / .yarn)
+    │       │
+    │   yarn_test       ← Restore cache & run test suite (needs create_cache)
+    │       │
+    ├── gitleaks        ← Secret scanning, runs in parallel (continue-on-error)
+    │       │
+    └───────┴── build_image  ← Docker build & push (needs yarn_test + gitleaks)
 ```
 
-![CI Pipeline Run](screenshots/ci-pipeline.png)
+![CI Pipeline Run](screenshots/gitleaks-scanning-ci-pipeline.png)
 
 ### Jobs
 
 | Job | Runtime | What it does |
 |---|---|---|
-| `create_cache` | `node:18-bullseye` | Runs `yarn install` and caches `node_modules` and `.yarn` keyed to `yarn.lock` |
+| `create_cache` | `node:18-bullseye` | Runs `yarn install` and caches `node_modules` and `.yarn` keyed to `yarn.lock` hash |
 | `yarn_test` | `node:18-bullseye` | Restores the cache, runs `yarn install`, then `yarn test` |
-| `build_image` | `docker:24` (DinD) | Builds the Docker image and pushes `ndubuisip/demo-app:juice-shop-1.0` to Docker Hub |
+| `gitleaks` | `zricethezav/gitleaks:latest` | Scans the full git history for secrets and leaked credentials (`continue-on-error: true`) |
+| `build_image` | `docker:24` (DinD) | Builds the Docker image and pushes `ndubuisip/demo-app:juice-shop-1.2` to Docker Hub |
+
+### Gitleaks — Secret Scanning
+
+Gitleaks scans every commit in the repository history for hardcoded secrets such as API keys, passwords, and tokens. It runs in parallel with `create_cache` and does not block the pipeline due to `continue-on-error: true`, but its findings are visible in the GitHub Actions log and must be reviewed and remediated.
+
+A scan of this repository across 27 commits (~9.15 MB) detected **43 leaks** across multiple files, flagged under the following rule violations:
+
+| Rule | Files affected |
+|---|---|
+| `generic-api-key` | `data/static/users.yml`, `routes/login.ts`, `test/api/*`, `frontend/src/app/*` |
+| `jwt` | `test/server/verifySpec.ts`, `test/server/currentUserSpec.ts`, `test/cypress/integration/e2e/forgedJwt.spec.ts` |
+| `private-key` | `lib/insecurity.ts` |
+
+![Gitleaks Findings](screenshots/gitleaks-findings.png)
+
+### Pre-Commit Hook — Local Secret Scanning
+
+To catch secrets **before** they are committed and pushed to the remote repository, a git pre-commit hook runs gitleaks locally on every `git commit`.
+
+#### How It Works
+
+```
+git commit
+    │
+    └── .git/hooks/pre-commit  ← runs automatically before the commit is recorded
+            │
+            ├── docker pull zricethezav/gitleaks:latest
+            └── docker run gitleaks detect --source="/path" --verbose
+                    │
+                    ├── leaks found  → commit is blocked (exit code 1)
+                    └── no leaks     → commit proceeds
+```
+
+#### Setup
+
+1. Create the hook file:
+```bash
+vim .git/hooks/pre-commit
+```
+
+2. Add the following content:
+```bash
+docker pull zricethezav/gitleaks:latest
+export path_to_host_folder_to_scan=/home/ndu/DevSecOps/juice-shop
+docker run -v ${path_to_host_folder_to_scan}:/path zricethezav/gitleaks:latest detect --source="/path" --verbose
+```
+
+3. Make it executable:
+```bash
+chmod +x .git/hooks/pre-commit
+```
+
+#### Why This Matters
+
+The pre-commit hook acts as the **first line of defence** — stopping secrets from ever entering the git history. This is earlier and cheaper than catching them in the CI pipeline, since secrets in git history require a full history rewrite to fully remove.
+
+| Layer | Where | Blocks commit? |
+|---|---|---|
+| Pre-commit hook | Local machine, before `git commit` | Yes (exit code 1) |
+| CI gitleaks job | GitHub Actions, after `git push` | No (`continue-on-error: true`) |
+
+> **Note:** `.git/hooks/` is not tracked by git. Each developer must set up the hook manually on their local machine.
 
 ### Why This CI Process Matters
 
 **1. Faster Builds with Caching**
-`create_cache` runs first and stores installed dependencies keyed to the `yarn.lock` hash. Subsequent jobs restore this cache, avoiding a full reinstall on every run and reducing overall pipeline time.
+`create_cache` runs first and stores installed dependencies keyed to the `yarn.lock` hash. Downstream jobs restore this cache, avoiding a full reinstall on every run and reducing overall pipeline time.
 
-**2. Tests as a Quality Gate**
-`build_image` has a hard `needs: yarn_test` dependency. A failing test blocks the image from being built or published — broken code cannot reach the registry.
+**2. Secret Detection on Every Push**
+`gitleaks` scans the full git history (`fetch-depth: 0`) on every push, catching hardcoded credentials before they spread further. Using `continue-on-error: true` ensures visibility of findings without blocking delivery while leaks are being remediated.
 
-**3. Consistent, Reproducible Builds**
+**3. Tests as a Quality Gate**
+`build_image` requires both `yarn_test` and `gitleaks` to complete (`needs: [yarn_test, gitleaks]`). A failing test blocks the image from being built or published — broken code cannot reach the registry.
+
+**4. Consistent, Reproducible Builds**
 Every job runs inside a clean containerized environment (`node:18-bullseye`, `docker:24`). This eliminates environment drift and ensures builds behave identically regardless of who pushes.
 
-**4. Automated Container Delivery**
+**5. Automated Container Delivery**
 On a successful run, a tested Docker image is automatically pushed to Docker Hub, removing manual steps and human error from the release process.
 
-**5. Auditability**
+**6. Auditability**
 Every pipeline run is logged in GitHub Actions with a full history of what passed, what failed, and when — giving a clear audit trail per commit.
 
 ---
