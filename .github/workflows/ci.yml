@@ -4,7 +4,7 @@ on: [push]
 
 env: 
   IMAGE_NAME: ndubuisip/demo-app
-  IMAGE_TAG: juice-shop-1.0 
+  IMAGE_TAG: juice-shop-1.2
 
 jobs:
   create_cache:
@@ -19,6 +19,7 @@ jobs:
             .yarn
           key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
       - run: yarn install
+
 
   yarn_test:
     runs-on: ubuntu-latest
@@ -35,9 +36,22 @@ jobs:
       - run: yarn install
       - run: yarn test
 
+  gitleaks:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: zricethezav/gitleaks:latest
+      options: --entrypoint ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git config --global --add safe.directory $GITHUB_WORKSPACE
+      - run: gitleaks detect --source . --verbose
+
   build_image:
     runs-on: ubuntu-latest
-    needs: yarn_test
+    needs: [yarn_test, gitleaks]
     container: docker:24
     services:
       docker:
