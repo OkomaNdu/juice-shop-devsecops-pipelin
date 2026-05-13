@@ -41,7 +41,7 @@ jobs:
 
   gitleaks:
     runs-on: ubuntu-latest
-    continue-on-error: true          # intentional — keeps pipeline running
+    continue-on-error: true
     container:
       image: zricethezav/gitleaks:latest
       options: --entrypoint ""
@@ -50,15 +50,18 @@ jobs:
         with:
           fetch-depth: 0
       - run: git config --global --add safe.directory $GITHUB_WORKSPACE
-      - run: gitleaks detect --source . --verbose --report-format sarif --report-path gitleaks.sarif
-      - name: Upload gitleaks report    # findings visible in GitHub Security tab
+      - run: gitleaks detect --source . --verbose -f json -r gitleaks.json
+      - name: Upload gitleaks report
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: gitleaks.sarif
+          name: gitleaks-report
+          path: gitleaks.json
 
   njsscan:
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
     steps:
       - name: Checkout the code
         uses: actions/checkout@v4
@@ -66,17 +69,33 @@ jobs:
         id: njsscan
         uses: ajinabraham/njsscan-action@master
         with:
-          args: '. --exit-warning'
+          args: '. --sarif --output results.sarif --exit-warning'
+      - name: Upload njsscan report
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+      - name: Save njsscan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: njsscan.sarif
+          path: results.sarif
 
   semgrep:
     runs-on: ubuntu-latest
-    continue-on-error: true 
+    continue-on-error: true
     container: semgrep/semgrep
     env:
       SEMGREP_RULES: p/javascript
     steps:
       - uses: actions/checkout@v4
-      - run: semgrep ci              
+      - run: semgrep ci --json --output semgrep.json
+      - name: Save semgrep artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep.json
+          path: semgrep.json            
 
   build_image:  # ← needs 2 spaces indent
     runs-on: ubuntu-latest
