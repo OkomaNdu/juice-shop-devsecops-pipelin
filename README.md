@@ -63,17 +63,19 @@ For a detailed introduction, full list of features and architecture overview ple
 
 ## CI Pipeline
 
-This project uses a CI pipeline implemented with [GitHub Actions](https://github.com/features/actions). The pipeline triggers on every `git push` and enforces a gate: the Docker image is only built and published if all tests pass.
+This project uses a CI pipeline implemented with [GitHub Actions](https://github.com/features/actions). The pipeline triggers on every `git push` and runs three sequential jobs: dependency caching, testing, and Docker image delivery.
 
 ### Pipeline Overview
 
 ```
 git push
     │
-    └── yarn_test          ← Install deps & run test suite (Node.js 18)
+    └── create_cache         ← Install deps & cache node_modules / .yarn
             │
-            └── build_image  ← Docker build & push to Docker Hub
-                              (only runs if yarn_test passes)
+            └── yarn_test    ← Restore cache & run test suite (Node.js 18)
+                    │
+                    └── build_image  ← Docker build & push to Docker Hub
+                                      (only runs if yarn_test passes)
 ```
 
 ![CI Pipeline Run](screenshots/ci-pipeline.png)
@@ -82,21 +84,25 @@ git push
 
 | Job | Runtime | What it does |
 |---|---|---|
-| `yarn_test` | `node:18-bullseye` | Runs `yarn install` then `yarn test` |
-| `build_image` | `docker:24` (DinD) | Builds Docker image and pushes `ndubuisip/demo-app:juice-shop-1.3` to Docker Hub |
+| `create_cache` | `node:18-bullseye` | Runs `yarn install` and caches `node_modules` and `.yarn` keyed to `yarn.lock` |
+| `yarn_test` | `node:18-bullseye` | Restores the cache, runs `yarn install`, then `yarn test` |
+| `build_image` | `docker:24` (DinD) | Builds the Docker image and pushes `ndubuisip/demo-app:juice-shop-1.0` to Docker Hub |
 
 ### Why This CI Process Matters
 
-**1. Tests as a Quality Gate**
+**1. Faster Builds with Caching**
+`create_cache` runs first and stores installed dependencies keyed to the `yarn.lock` hash. Subsequent jobs restore this cache, avoiding a full reinstall on every run and reducing overall pipeline time.
+
+**2. Tests as a Quality Gate**
 `build_image` has a hard `needs: yarn_test` dependency. A failing test blocks the image from being built or published — broken code cannot reach the registry.
 
-**2. Consistent, Reproducible Builds**
-Every job runs inside a clean containerized environment (`node:18-bullseye`, `docker:24`). This eliminates environment drift and ensures builds are identical regardless of who pushes.
+**3. Consistent, Reproducible Builds**
+Every job runs inside a clean containerized environment (`node:18-bullseye`, `docker:24`). This eliminates environment drift and ensures builds behave identically regardless of who pushes.
 
-**3. Automated Container Delivery**
+**4. Automated Container Delivery**
 On a successful run, a tested Docker image is automatically pushed to Docker Hub, removing manual steps and human error from the release process.
 
-**4. Auditability**
+**5. Auditability**
 Every pipeline run is logged in GitHub Actions with a full history of what passed, what failed, and when — giving a clear audit trail per commit.
 
 ---
