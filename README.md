@@ -95,7 +95,7 @@ git push
 
 Gitleaks scans every commit in the repository history for hardcoded secrets such as API keys, passwords, and tokens. It runs in parallel with `create_cache` and does not block the pipeline due to `continue-on-error: true`, but its findings are visible in the GitHub Actions log and must be reviewed and remediated.
 
-A scan of this repository across 27 commits (~9.15 MB) detected **43 leaks** across multiple files, flagged under the following rule violations:
+An initial scan of this repository across 27 commits (~9.15 MB) detected **43 leaks** across multiple files, flagged under the following rule violations:
 
 | Rule | Files affected |
 |---|---|
@@ -104,6 +104,26 @@ A scan of this repository across 27 commits (~9.15 MB) detected **43 leaks** acr
 | `private-key` | `lib/insecurity.ts` |
 
 ![Gitleaks Findings](screenshots/gitleaks-findings.png)
+
+### Handling False Positives — `.gitleaks.toml`
+
+Many of the 43 findings were in test files (`test/`, `*.spec.ts`) which contain intentional mock credentials used for testing purposes — these are **false positives**. To suppress them, a `.gitleaks.toml` configuration file was created at the root of the repository.
+
+```toml
+[extend]
+useDefault = true
+
+[allowlist]
+paths = ['test', '.*\/test\/.*']
+```
+
+**What this does:**
+- `useDefault = true` — extends the built-in gitleaks default ruleset
+- `paths` allowlist — excludes any file under a `test` directory from being scanned
+
+After applying the configuration, a re-scan across **29 commits (~9.15 MB)** reduced findings from **43 → 10 leaks**, isolating only real secrets in production code such as `lib/insecurity.ts` and `routes/login.ts`.
+
+![Gitleaks False Positive Handling](screenshots/gitleaks-false-positive.png)
 
 ### Pre-Commit Hook — Local Secret Scanning
 
