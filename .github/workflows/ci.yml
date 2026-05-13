@@ -82,7 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: semgrep ci --no-suppress-errors              # fail on analysis errors
-jobs:
+
   build_image:  # ← needs 2 spaces indent
     runs-on: ubuntu-latest
     needs: [yarn_test, gitleaks, njsscan, semgrep]
