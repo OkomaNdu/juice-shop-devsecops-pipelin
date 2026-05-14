@@ -40,6 +40,7 @@ For a detailed introduction, full list of features and architecture overview ple
 
 - [CI Pipeline](#ci-pipeline)
     - [Pre-Commit Hook](#pre-commit-hook--local-secret-scanning)
+- [Vulnerability Management: DefectDojo](#vulnerability-management-defectdojo)
 - [Setup](#setup)
     - [From Sources](#from-sources)
     - [Packaged Distributions](#packaged-distributions)
@@ -93,9 +94,9 @@ git push
 |---|---|---|---|
 | `create_cache` | `node:18-bullseye` | On every push | Cached `node_modules` / `.yarn` keyed to `yarn.lock` hash |
 | `yarn_test` | `node:18-bullseye` | `needs: create_cache` | Test pass/fail result |
-| `gitleaks` | `zricethezav/gitleaks:latest` | On every push (`continue-on-error: true`) | `gitleaks.sarif` uploaded to GitHub Security tab |
-| `njsscan` | `ajinabraham/njsscan-action@master` | On every push | `results.sarif` uploaded to GitHub Code Scanning |
-| `semgrep` | `semgrep/semgrep` | On every push (`continue-on-error: true`) | Blocking findings logged to GitHub Actions |
+| `gitleaks` | `zricethezav/gitleaks:latest` | On every push (`continue-on-error: true`) | `gitleaks.json` uploaded as pipeline artifact |
+| `njsscan` | `ajinabraham/njsscan-action@master` | On every push | `results.sarif` uploaded to GitHub Code Scanning + `njsscan.sarif` artifact |
+| `semgrep` | `semgrep/semgrep` | On every push (`continue-on-error: true`) | `semgrep.json` uploaded as pipeline artifact |
 | `build_image` | `docker:24` (DinD) | `needs: [yarn_test, gitleaks, njsscan, semgrep]` | `ndubuisip/demo-app:juice-shop-1.2` pushed to Docker Hub |
 
 ---
@@ -108,10 +109,10 @@ Gitleaks performs retrospective secret scanning across the full git history on e
 
 **Scan command:**
 ```bash
-gitleaks detect --source . --verbose --report-format sarif --report-path gitleaks.sarif
+gitleaks detect --source . --verbose -f json -r gitleaks.json
 ```
 
-Findings are serialised to SARIF and uploaded to the **GitHub Security tab** via `github/codeql-action/upload-sarif@v3` using an `if: always()` condition, guaranteeing report upload regardless of whether the scan step exits with an error.
+Findings are serialised to JSON and uploaded as a downloadable pipeline artifact (`gitleaks-report`) via `actions/upload-artifact@v4` using an `if: always()` condition — guaranteeing report preservation regardless of whether the scan exits with an error. This report is available for download from the **GitHub Actions run → Artifacts** section for offline triage and audit.
 
 **Scan results — 37 commits scanned (~9.16 MB):**
 
@@ -157,7 +158,8 @@ paths = ['test', '.*\/test\/.*']
 - Arguments: `. --sarif --output results.sarif --exit-warning`
 - `--exit-warning` — exits non-zero on findings without causing a hard pipeline failure
 - Requires `permissions: security-events: write` to publish SARIF results
-- Findings are uploaded to **GitHub Security → Code Scanning** via `github/codeql-action/upload-sarif@v3`, providing a queryable, persistent record of vulnerabilities per commit
+- Findings are uploaded to **GitHub Security → Code Scanning** via `github/codeql-action/upload-sarif@v4`, providing a queryable, persistent record of vulnerabilities per commit
+- The SARIF report is additionally saved as a downloadable artifact (`njsscan.sarif`) via `actions/upload-artifact@v4` with `if: always()`, ensuring report availability for offline review regardless of job outcome
 
 ![njsscan CI Output](screenshots/njsscan-results.png)
 
@@ -170,8 +172,9 @@ paths = ['test', '.*\/test\/.*']
 **CI job configuration:**
 - Container: `semgrep/semgrep`
 - Ruleset: `SEMGREP_RULES: p/javascript` (community ruleset)
-- Command: `semgrep ci`
+- Command: `semgrep ci --json --output semgrep.json`
 - `continue-on-error: true` — pipeline proceeds to `build_image` regardless of findings, maintaining delivery velocity while findings are triaged
+- Findings are serialised to JSON and uploaded as a downloadable artifact (`semgrep.json`) via `actions/upload-artifact@v4` with `if: always()`, ensuring the report is retained for triage regardless of job outcome
 
 **Scan results — latest CI run:**
 
@@ -185,6 +188,165 @@ Semgrep scanned **822 files** using **74 active rules** and reported **23 blocki
 ![Semgrep CI Output](screenshots/semgrep-results.png)
 
 ![Semgrep Summary Results](screenshots/semgrep-summary-results.png)
+
+---
+
+### Scan Report Artefacts
+
+All three security scanning jobs are configured to persist their output reports as downloadable pipeline artefacts using `actions/upload-artifact@v4`. Reports are uploaded unconditionally via `if: always()`, ensuring they are retained regardless of whether the scan job passes or fails. This enables offline triage, integration with external SIEM or vulnerability management platforms, and audit trail preservation beyond the GitHub Actions log retention window.
+
+**Artefacts produced per pipeline run:**
+
+| Artefact Name | Source Job | Format | Size | Description |
+|---|---|---|---|---|
+| `gitleaks-report` | `gitleaks` | JSON | ~2.17 KB | Full secret detection output including rule ID, file, line, commit, and entropy per finding |
+| `njsscan.sarif` | `njsscan` | SARIF | ~422 Bytes | Node.js SAST findings in SARIF format, compatible with GitHub Code Scanning and external tooling |
+| `semgrep.json` | `semgrep` | JSON | ~8.48 KB | Multi-language static analysis findings including rule metadata, severity, and affected code location |
+
+Artefacts are accessible from the **GitHub Actions run summary → Artifacts** section and are available for download for the duration of the configured retention period.
+
+![Scan Report Artifacts](screenshots/scan-report-artifacts.png)
+
+---
+
+### Vulnerability Management: DefectDojo
+
+Following each pipeline run, the scan artefacts produced by Gitleaks, Semgrep, and njsscan are imported into **DefectDojo** — an open-source vulnerability management platform — providing a centralised, deduplicated, and auditable view of all security findings across the project lifecycle. This transforms raw scanner output into a structured risk register, enabling systematic triage, remediation tracking, and compliance reporting beyond what GitHub's native Code Scanning surface provides.
+
+#### Accessing DefectDojo
+
+**Demo Server**
+
+Try out the demo instance at [demo.defectdojo.org](https://demo.defectdojo.org/).
+
+Log in with: `admin / 1Defectdojo@demo#appsec`
+
+> **Note:** The demo instance is publicly accessible and is regularly reset. Do not store sensitive or production data in the demo environment.
+
+**Self-Hosted Quick Start**
+
+To run DefectDojo locally using Docker:
+
+```sh
+git clone https://github.com/DefectDojo/django-DefectDojo
+cd django-DefectDojo
+
+# Build the containers
+docker-compose build
+
+# Start the stack
+docker-compose up
+
+# Retrieve the auto-generated admin password (initializer can take up to 3 minutes)
+docker-compose logs initializer | grep "Admin password:"
+```
+
+Navigate to **http://localhost:8080** and log in with `admin` and the password retrieved from the initializer logs.
+
+---
+
+#### Engagement Configuration
+
+An engagement named **"release version 1.1"** was created within DefectDojo under the **Secure-Juice-App** product, scoped to a 7-day assessment window (13th–20th May). Three scan imports were performed, each mapped to the corresponding scanner format:
+
+| Test Name | Import Format | Active Findings |
+|---|---|---|
+| Gitleaks Scan | Gitleaks JSON | 9 |
+| Semgrep JSON Report | Semgrep JSON | 23 |
+| nodejsscan Scan | NodeJsScan SARIF | 0 |
+
+**Total active findings: 41 | High: 15 | Medium: 26**
+
+> **Note:** Total open findings across the product represent the combined output of all three scan imports. DefectDojo aggregates findings at the product level, meaning findings from multiple engagement runs contribute to the overall open count.
+
+![DefectDojo Engagement Overview](screenshots/defectdojo-engagement.png)
+
+---
+
+#### Open Findings — CWE-798: Hardcoded Credentials (Gitleaks)
+
+The Gitleaks import surfaced **41 open findings** across the codebase, all classified **High severity** and mapped to **CWE-798 — Use of Hard-coded Credentials**. These findings correspond to generic API keys and JWT tokens embedded directly in source files and git history — including `data/static/users.yml`, `lib/insecurity.ts`, and `routes/login.ts`.
+
+> **CWE-798** — *Use of Hard-coded Credentials:* The software contains hard-coded credentials, such as a password or cryptographic key, which it uses for its own inbound authentication, outbound communication to external components, or encryption of internal data.
+
+**Risk:** Hard-coded credentials in version-controlled code represent an irrecoverable secret exposure once pushed to any remote. Rotation alone is insufficient without a full git history rewrite (e.g., `git filter-repo`) to expunge the secret from all historical commits.
+
+**Recommended remediation:**
+- Migrate all secrets to environment variables or a secrets manager (e.g., HashiCorp Vault, AWS Secrets Manager)
+- Rotate all exposed keys and JWT signing secrets immediately
+- Rewrite git history to purge secrets from prior commits
+- Enforce gitleaks pre-commit hooks across all developer workstations to prevent recurrence
+
+![DefectDojo Open Findings - CWE-798](screenshots/defectdojo-findings-cwe798.png)
+
+---
+
+#### Critical Finding — CWE-89: SQL Injection (Semgrep)
+
+Semgrep identified a **CWE-89 SQL Injection** vulnerability at **Finding ID 115**, rated **High severity**, located at `routes/search.ts` line 23.
+
+| Field | Value |
+|---|---|
+| Finding ID | 115 |
+| CWE | CWE-89 — Improper Neutralisation of Special Elements in SQL Commands |
+| Severity | High |
+| Scanner | Semgrep JSON Report |
+| File | `routes/search.ts` |
+| Line | 23 |
+| Rule | `javascript.sequelize.security.audit.sequelize-injection-express` |
+
+> **CWE-89** — *Improper Neutralization of Special Elements used in an SQL Command ("SQL Injection"):* The software constructs all or part of an SQL command using externally-influenced input from an upstream component, but does not neutralise or incorrectly neutralises special elements that could modify the intended SQL command when it is sent to a downstream component.
+
+**Root cause:** The `routes/search.ts` handler passes unsanitised Express request parameters directly into a Sequelize ORM query without parameterisation — allowing an attacker to manipulate the SQL query structure, extract arbitrary data, or bypass authentication controls.
+
+**Recommended remediation:**
+- Replace raw string interpolation with Sequelize parameterised queries (`where: { col: req.query.val }`) or prepared statements
+- Apply input validation and allowlisting at the route handler level
+- Enforce Semgrep's `p/javascript` ruleset in CI as a mandatory blocking gate (remove `continue-on-error: true`) once the baseline findings are remediated
+
+![DefectDojo CWE-89 Finding Detail](screenshots/defectdojo-finding-cwe89.png)
+
+![CWE-89 MITRE Definition](screenshots/defectdojo-cwe89-mitre.png)
+
+---
+
+#### Medium Severity Findings — Express.js Security Misconfigurations (Semgrep)
+
+Beyond the critical SQL Injection finding, Semgrep's `p/javascript` ruleset flagged **26 Medium severity** findings across the Express.js application layer. All findings originate from the **Semgrep JSON Report** import, totalling **41 open findings** across the product (`demo.defectdojo.org/product/2/finding/open?page_size=150`).
+
+These findings represent a class of application-layer misconfigurations commonly exploited in Express.js APIs — each mapped to a specific Semgrep rule and line reference in the codebase:
+
+| Semgrep Rule | Vulnerability Class | Affected Lines |
+|---|---|---|
+| `javascript.express.security.audit.express-res-sendfile` | Insecure file serving via `res.sendFile()` without root restriction | 73 |
+| `javascript.express.security.audit.express-path-join-resolve` | Path traversal via unsanitised `path.join()` / `path.resolve()` | 22 |
+| `javascript.express.security.audit.express-check-directory-listings` | Directory listing exposure | 548 |
+| `javascript.express.security.audit.express-ssrf` | Server-Side Request Forgery (SSRF) in Express route handlers | 918 |
+| `javascript.express.security.express-insecure-template-usage` | Insecure template rendering (potential SSTI) | 1336 |
+| `javascript.express.security.audit.express-open-redirect` | Open redirect via unvalidated user-supplied URL | 601 |
+| `javascript.express.security.audit.express-jwt-not-revoked` | JWT tokens accepted without revocation check | 522 |
+
+**Key observations:**
+- Multiple rules fire across repeated code patterns (e.g., `express-res-sendfile` and `express-path-join-resolve` appear at the same lines across several route files), indicating systemic misuse of Express primitives rather than isolated incidents.
+- `express-jwt-not-revoked` at line 522 indicates that issued JWT tokens remain valid indefinitely — there is no server-side token blacklist or revocation mechanism in place, which is a known authentication bypass risk.
+- `express-ssrf` at line 918 suggests that user-controlled input influences outbound HTTP requests, potentially enabling attackers to proxy requests to internal services or cloud metadata endpoints.
+- `express-insecure-template-usage` at line 1336 indicates user-controlled data is rendered via a template engine without sanitisation — a prerequisite condition for Server-Side Template Injection (SSTI).
+
+![DefectDojo Semgrep Medium Findings - Page 1](screenshots/defectdojo-semgrep-medium-1.png)
+
+![DefectDojo Semgrep Medium Findings - Page 2](screenshots/defectdojo-semgrep-medium-2.png)
+
+---
+
+#### DefectDojo Integration Value
+
+| Capability | Benefit |
+|---|---|
+| **Centralised risk register** | All findings from Gitleaks, Semgrep, and njsscan consolidated in a single auditable dashboard |
+| **CWE classification** | Automatic mapping to MITRE CWE taxonomy enables prioritisation by vulnerability class |
+| **Deduplication** | Repeated findings across scan runs are merged, reducing alert fatigue |
+| **Remediation tracking** | Findings can be assigned, dated, and closed with evidence — supporting compliance workflows |
+| **Engagement scoping** | Findings are bounded to a release window, providing a point-in-time security posture snapshot for each delivery |
 
 ---
 
