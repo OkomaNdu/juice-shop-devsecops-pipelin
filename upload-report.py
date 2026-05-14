@@ -10,7 +10,7 @@ data = {
     'active': True,
     'varified': True,
     'scan_type': 'Gitleaks Scan',
-    'minimum_severity': 'low'
+    'minimum_severity': 'low',
     'engagement': 4
 }
 
