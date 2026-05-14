@@ -11,7 +11,7 @@ data = {
     'active': True,
     'verified': True,
     'scan_type': 'Gitleaks Scan',
-    'minimum_severity': 'low',
+    'minimum_severity': 'Low',
     'engagement': 4
 }
 
