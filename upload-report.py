@@ -5,7 +5,7 @@ headers = {
     'Authorization': f'Token {os.environ["DEFECTDOJO_API_KEY"]}'
 }
 
-url = 'https://demo.defectdojo.org/v2/import-scan/'
+url = 'https://demo.defectdojo.org/api/v2/import-scan/'
 
 data = {
     'active': True,
