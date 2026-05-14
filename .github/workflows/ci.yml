@@ -103,7 +103,8 @@ jobs:
     container: python:3
     steps:
       - uses: actions/checkout@v4
-      - run: python3 upload-report.py                  
+      - run: pip install requests
+      - run: python3 upload-report.py                 
 
   build_image:  # ← needs 2 spaces indent
     runs-on: ubuntu-latest
