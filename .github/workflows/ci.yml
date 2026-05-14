@@ -105,8 +105,12 @@ jobs:
       DEFECTDOJO_API_KEY: ${{ vars.DEFECTDOJO_API_KEY }}
     steps:
       - uses: actions/checkout@v4
+      - name: Download gitleaks report
+        uses: actions/download-artifact@v4
+        with:
+          name: gitleaks-report
       - run: pip install requests
-      - run: python3 upload-report.py                 
+      - run: python3 upload-report.py               
 
   build_image:  # ← needs 2 spaces indent
     runs-on: ubuntu-latest
