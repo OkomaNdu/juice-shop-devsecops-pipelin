@@ -1,4 +1,5 @@
 import requests
+import os
 
 headers = {
     'Authorization': f'Token {os.environ["DEFECTDOJO_API_KEY"]}'

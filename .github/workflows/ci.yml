@@ -101,6 +101,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [gitleaks]
     container: python:3
+    env:
+      DEFECTDOJO_API_KEY: ${{ vars.DEFECTDOJO_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - run: pip install requests
