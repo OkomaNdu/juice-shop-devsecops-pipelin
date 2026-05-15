@@ -65,25 +65,26 @@ For a detailed introduction, full list of features and architecture overview ple
 
 ## CI Pipeline
 
-This project implements a **DevSecOps CI pipeline** using [GitHub Actions](https://github.com/features/actions), integrating automated security controls directly into the software delivery lifecycle. The pipeline is triggered on every `git push` and orchestrates six jobs across two execution stages:
+This project implements a **DevSecOps CI pipeline** using [GitHub Actions](https://github.com/features/actions), integrating automated security controls directly into the software delivery lifecycle. The pipeline is triggered on every `git push` and orchestrates seven jobs across two execution stages:
 
 - **Stage 1 — Parallel security scanning and test execution:** `create_cache`, `yarn_test`, `gitleaks`, `njsscan`, and `semgrep` run concurrently, maximising feedback speed.
-- **Stage 2 — Gated image delivery:** `build_image` executes only after all Stage 1 jobs complete, ensuring no artefact is published without passing security validation and functional testing.
+- **Stage 2 — Gated delivery and automated reporting:** `upload_reports` automatically imports scan artefacts into DefectDojo via REST API; `build_image` builds and pushes the Docker image to the registry. Both run in parallel once Stage 1 completes.
 
 ### Pipeline Architecture
 
 ```
 git push
     │
-    ├── create_cache    ← Installs and caches dependencies (node_modules / .yarn)
+    ├── create_cache      ← Installs and caches dependencies (node_modules / .yarn)
     │       │
-    │   yarn_test       ← Restores cache and executes unit test suite
-    │       │
-    ├── gitleaks        ← Scans full git history for secrets; outputs SARIF (continue-on-error)
-    ├── njsscan         ← Node.js SAST; uploads findings to GitHub Code Scanning via SARIF
-    ├── semgrep         ← Multi-language SAST using p/javascript ruleset (continue-on-error)
-    │       │
-    └───────┴── build_image  ← Docker build & push to registry (needs: all above)
+    │   yarn_test ────────────────────────────────────────────────────────┐
+    │                                                                      │
+    ├── gitleaks ─────────────────────────────────────────┬───────────────┤
+    ├── njsscan  ─────────────────────────────────────────┤               │
+    ├── semgrep  ─────────────────────────────────────────┤               │
+    │                                                     │               │
+    │                                            upload_reports      build_image
+    │                                            (→ DefectDojo API)  (→ Docker Hub)
 ```
 
 ![CI Pipeline Run](screenshots/sast-ci-pipeline.png)
@@ -97,97 +98,8 @@ git push
 | `gitleaks` | `zricethezav/gitleaks:latest` | On every push (`continue-on-error: true`) | `gitleaks.json` uploaded as pipeline artifact |
 | `njsscan` | `ajinabraham/njsscan-action@master` | On every push | `results.sarif` uploaded to GitHub Code Scanning + `njsscan.sarif` artifact |
 | `semgrep` | `semgrep/semgrep` | On every push (`continue-on-error: true`) | `semgrep.json` uploaded as pipeline artifact |
+| `upload_reports` | `python:3` | `needs: [gitleaks, njsscan, semgrep]` | `gitleaks.json`, `njsscan.sarif`, `semgrep.json` imported into DefectDojo via REST API |
 | `build_image` | `docker:24` (DinD) | `needs: [yarn_test, gitleaks, njsscan, semgrep]` | `ndubuisip/demo-app:juice-shop-1.2` pushed to Docker Hub |
-
----
-
-### Stage 1 — Security Scanning
-
-#### Secret Detection: Gitleaks
-
-Gitleaks performs retrospective secret scanning across the full git history on every push, targeting hardcoded credentials including API keys, passwords, tokens, and private keys. The job is configured with `continue-on-error: true` to maintain pipeline continuity during active remediation, while ensuring findings remain fully visible to engineering teams.
-
-**Scan command:**
-```bash
-gitleaks detect --source . --verbose -f json -r gitleaks.json
-```
-
-Findings are serialised to JSON and uploaded as a downloadable pipeline artifact (`gitleaks-report`) via `actions/upload-artifact@v4` using an `if: always()` condition — guaranteeing report preservation regardless of whether the scan exits with an error. This report is available for download from the **GitHub Actions run → Artifacts** section for offline triage and audit.
-
-**Scan results — 37 commits scanned (~9.16 MB):**
-
-| Rule ID | Affected Files |
-|---|---|
-| `generic-api-key` | `data/static/users.yml`, `routes/login.ts`, `test/api/*`, `frontend/src/app/*` |
-| `jwt` | `test/server/verifySpec.ts`, `test/server/currentUserSpec.ts`, `test/cypress/integration/e2e/forgedJwt.spec.ts` |
-| `private-key` | `lib/insecurity.ts` |
-
-An initial scan identified **43 leaks**. After applying allowlist configuration (see below), findings were reduced to **10 verified production secrets**.
-
-![Gitleaks CI Output](screenshots/gitleaks-findings.png)
-
-#### False Positive Suppression — `.gitleaks.toml`
-
-The majority of initial findings originated from test fixtures (`test/`, `*.spec.ts`) containing intentional mock credentials — classified as false positives. A `.gitleaks.toml` configuration file was introduced at the repository root to apply an allowlist, scoping scans to production code only.
-
-```toml
-[extend]
-useDefault = true
-
-[allowlist]
-paths = ['test', '.*\/test\/.*']
-```
-
-| Directive | Purpose |
-|---|---|
-| `useDefault = true` | Extends the built-in gitleaks ruleset without overriding default detection logic |
-| `paths` allowlist | Excludes all files within `test/` directories from secret detection |
-
-**Result:** 43 initial findings reduced to **10 verified leaks** across 37 commits (~9.16 MB), isolating genuine secrets in `lib/insecurity.ts` and `routes/login.ts` for targeted remediation.
-
-![Gitleaks False Positive Suppression](screenshots/gitleaks-false-positive.png)
-
----
-
-#### SAST: njsscan
-
-`njsscan` is a Node.js-specific static analysis tool that identifies insecure coding patterns, dangerous API usage, and known vulnerability signatures in JavaScript and TypeScript source code.
-
-**CI job configuration:**
-- Action: `ajinabraham/njsscan-action@master`
-- Arguments: `. --sarif --output results.sarif --exit-warning`
-- `--exit-warning` — exits non-zero on findings without causing a hard pipeline failure
-- Requires `permissions: security-events: write` to publish SARIF results
-- Findings are uploaded to **GitHub Security → Code Scanning** via `github/codeql-action/upload-sarif@v4`, providing a queryable, persistent record of vulnerabilities per commit
-- The SARIF report is additionally saved as a downloadable artifact (`njsscan.sarif`) via `actions/upload-artifact@v4` with `if: always()`, ensuring report availability for offline review regardless of job outcome
-
-![njsscan CI Output](screenshots/njsscan-results.png)
-
----
-
-#### SAST: Semgrep
-
-`semgrep` is an open-source, multi-language static analysis engine that applies community and custom rulesets to detect security anti-patterns, OWASP Top 10 vulnerabilities, and insecure configurations across JavaScript and TypeScript codebases.
-
-**CI job configuration:**
-- Container: `semgrep/semgrep`
-- Ruleset: `SEMGREP_RULES: p/javascript` (community ruleset)
-- Command: `semgrep ci --json --output semgrep.json`
-- `continue-on-error: true` — pipeline proceeds to `build_image` regardless of findings, maintaining delivery velocity while findings are triaged
-- Findings are serialised to JSON and uploaded as a downloadable artifact (`semgrep.json`) via `actions/upload-artifact@v4` with `if: always()`, ensuring the report is retained for triage regardless of job outcome
-
-**Scan results — latest CI run:**
-
-| Language | Rules Applied | Files Scanned | Ruleset Origin |
-|---|---|---|---|
-| TypeScript (`ts`) | 74 | 401 | Community |
-| JavaScript (`js`) | 68 | 4 | Community |
-
-Semgrep scanned **822 files** using **74 active rules** and reported **23 blocking findings**. Critical findings include SQL injection vulnerabilities in `data/static/codefixes/dbSchemaChallenge_1.ts`, flagged by the `javascript.sequelize.security.audit.sequelize-injection-express` rule — indicating user-controlled input passed directly to Sequelize ORM queries without parameterisation.
-
-![Semgrep CI Output](screenshots/semgrep-results.png)
-
-![Semgrep Summary Results](screenshots/semgrep-summary-results.png)
 
 ---
 
@@ -211,7 +123,7 @@ Artefacts are accessible from the **GitHub Actions run summary → Artifacts** s
 
 ### Vulnerability Management: DefectDojo
 
-Following each pipeline run, the scan artefacts produced by Gitleaks, Semgrep, and njsscan are imported into **DefectDojo** — an open-source vulnerability management platform — providing a centralised, deduplicated, and auditable view of all security findings across the project lifecycle. This transforms raw scanner output into a structured risk register, enabling systematic triage, remediation tracking, and compliance reporting beyond what GitHub's native Code Scanning surface provides.
+Scan artefacts produced by Gitleaks, Semgrep, and njsscan are automatically imported into **DefectDojo** — an open-source vulnerability management platform — on every pipeline run via a dedicated `upload_reports` CI job. This eliminates manual report handling, providing a centralised, deduplicated, and auditable vulnerability register that is updated continuously with every code push.
 
 #### Accessing DefectDojo
 
@@ -245,19 +157,72 @@ Navigate to **http://localhost:8080** and log in with `admin` and the password r
 
 ---
 
-#### Engagement Configuration
+#### Automated Report Upload — `upload_reports` Job
 
-An engagement named **"release version 1.1"** was created within DefectDojo under the **Secure-Juice-App** product, scoped to a 7-day assessment window (13th–20th May). Three scan imports were performed, each mapped to the corresponding scanner format:
+The `upload_reports` job runs in a `python:3` container and executes only after `gitleaks`, `njsscan`, and `semgrep` have all completed (`needs: [gitleaks, njsscan, semgrep]`). It downloads the three scan artefacts from the GitHub Actions artefact store and imports each one into DefectDojo via the REST API.
 
-| Test Name | Import Format | Active Findings |
-|---|---|---|
-| Gitleaks Scan | Gitleaks JSON | 9 |
-| Semgrep JSON Report | Semgrep JSON | 23 |
-| nodejsscan Scan | NodeJsScan SARIF | 0 |
+**Job sequence:**
 
-**Total active findings: 41 | High: 15 | Medium: 26**
+```
+gitleaks ──┐
+njsscan  ──┼──► upload_reports (python:3)
+semgrep  ──┘         │
+                     ├── download gitleaks-report   → gitleaks.json
+                     ├── download njsscan.sarif     → njsscan.sarif
+                     ├── download semgrep.json      → semgrep.json
+                     ├── pip install requests
+                     ├── python3 upload-report.py gitleaks.json
+                     ├── python3 upload-report.py njsscan.sarif
+                     └── python3 upload-report.py semgrep.json
+                                  │
+                                  └──► POST /api/v2/import-scan/ → DefectDojo
+```
 
-> **Note:** Total open findings across the product represent the combined output of all three scan imports. DefectDojo aggregates findings at the product level, meaning findings from multiple engagement runs contribute to the overall open count.
+**Authentication:** The API key is stored as a GitHub repository variable (`vars.DEFECTDOJO_API_KEY`) and injected into the job environment as `DEFECTDOJO_API_KEY`. It is never hard-coded in the workflow or the upload script.
+
+#### `upload-report.py` — Script Breakdown
+
+The `upload-report.py` script accepts a single filename argument (`sys.argv[1]`) and maps it to the corresponding DefectDojo `scan_type` before posting to the import API:
+
+| Input File | DefectDojo `scan_type` |
+|---|---|
+| `gitleaks.json` | `Gitleaks Scan` |
+| `njsscan.sarif` | `SARIF` |
+| `semgrep.json` | `Semgrep JSON Report` |
+
+**API call configuration:**
+
+```python
+url  = 'https://demo.defectdojo.org/api/v2/import-scan/'
+
+data = {
+    'active':           True,
+    'verified':         True,
+    'scan_type':        scan_type,      # mapped from filename
+    'minimum_severity': 'Low',
+    'engagement':       6               # targets engagement ID 6
+}
+```
+
+- `active: True` — findings are immediately marked active in the risk register
+- `verified: True` — findings are pre-marked as verified, bypassing manual triage for known scanner output
+- `minimum_severity: 'Low'` — all severity levels are ingested; no findings are filtered at import
+- `engagement: 6` — all reports are imported into a pre-configured DefectDojo engagement, scoping findings to the correct product and release window
+- A HTTP `201 Created` response confirms successful import; any other status code prints the response body for debugging
+
+#### Engagement Findings Summary
+
+Following a successful pipeline run, all three scan reports are imported into engagement ID 6 — **release version 1.1.0** — on the **juice-shop** product in DefectDojo. The engagement is scoped to a 7-day CI/CD window (15th–22nd May) and was created 22 minutes after the pipeline run, with the upload completing 19 minutes after creation.
+
+The screenshot below confirms the automated import via `upload_reports`. All findings are immediately marked **active and verified**, consistent with `active: True` and `verified: True` set in `upload-report.py`:
+
+| Title / Type | Date | Total Findings | Active (Verified / Fixable) | Mitigated | Duplicates |
+|---|---|---|---|---|---|
+| Gitleaks Scan | May 15, 2026 | 9 | 9 (9 / 0) | 0 | 0 |
+| Semgrep JSON Report | May 15, 2026 | 23 | 23 (23 / 0) | 0 | 0 |
+| nodejsscan Scan (SARIF) | May 15, 2026 | 0 | 0 (0 / 0) | 0 | 0 |
+
+**Engagement total: 32 active findings | Critical: 0 | High: 15 | Medium: 17 | Low: 0**
 
 ![DefectDojo Engagement Overview](screenshots/defectdojo-engagement.png)
 
