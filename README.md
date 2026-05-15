@@ -39,7 +39,6 @@ For a detailed introduction, full list of features and architecture overview ple
 ## Table of contents
 
 - [CI Pipeline](#ci-pipeline)
-    - [Pre-Commit Hook](#pre-commit-hook--local-secret-scanning)
 - [Vulnerability Management: DefectDojo](#vulnerability-management-defectdojo)
 - [Setup](#setup)
     - [From Sources](#from-sources)
@@ -340,53 +339,6 @@ These findings represent a class of application-layer misconfigurations commonly
 
 ---
 
-### Pre-Commit Hook — Local Secret Scanning
-
-To intercept secrets **before** they enter the git history, a git pre-commit hook executes gitleaks locally on every `git commit`. This represents the earliest possible enforcement point in the development workflow — upstream of the CI pipeline — where remediation is least costly.
-
-#### Execution Flow
-
-```
-git commit
-    │
-    └── .git/hooks/pre-commit       ← executes automatically prior to commit recording
-            │
-            ├── Pull latest gitleaks image
-            └── Run gitleaks detect --source="/path" --verbose
-                    │
-                    ├── Secrets detected  → exit code 1 — commit is blocked
-                    └── No secrets found  → commit proceeds normally
-```
-
-#### Setup Instructions
-
-**Step 1 — Create the hook file:**
-```bash
-vim .git/hooks/pre-commit
-```
-
-**Step 2 — Add the following script:**
-```bash
-docker pull zricethezav/gitleaks:latest
-export path_to_host_folder_to_scan=/home/ndu/DevSecOps/juice-shop
-docker run -v ${path_to_host_folder_to_scan}:/path zricethezav/gitleaks:latest detect --source="/path" --verbose
-```
-
-**Step 3 — Grant execute permission:**
-```bash
-chmod +x .git/hooks/pre-commit
-```
-
-#### Security Control Layering
-
-| Control Layer | Enforcement Point | Blocks on Detection? |
-|---|---|---|
-| Pre-commit hook | Local — before `git commit` | Yes — exits with code 1 |
-| CI `gitleaks` job | Remote — after `git push` | No — `continue-on-error: true` |
-
-> **Operational Note:** `.git/hooks/` is not tracked by git and is not propagated via `git clone`. Each engineer must configure the hook independently on their local workstation.
-
----
 
 ### Security Architecture Summary
 
