@@ -105,7 +105,7 @@ git push
 
 ### Scan Report Artefacts
 
-All three security scanning jobs are configured to persist their output reports as downloadable pipeline artefacts using `actions/upload-artifact@v4`. Reports are uploaded unconditionally via `if: always()`, ensuring they are retained regardless of whether the scan job passes or fails. This enables offline triage, integration with external SIEM or vulnerability management platforms, and audit trail preservation beyond the GitHub Actions log retention window.
+All three security scanning jobs are configured to persist their output reports as downloadable pipeline artefacts using `actions/upload-artifact@v4`. Reports are uploaded unconditionally via `if: always()`, ensuring they are retained regardless of whether the scan job passes or fails. This enables offline triage, integration with external vulnerability management platforms, and audit trail preservation beyond the GitHub Actions log retention window.
 
 **Artefacts produced per pipeline run:**
 
@@ -230,7 +230,7 @@ The screenshot below confirms the automated import via `upload_reports`. All fin
 
 #### Open Findings — CWE-798: Hardcoded Credentials (Gitleaks)
 
-The Gitleaks import surfaced **41 open findings** across the codebase, all classified **High severity** and mapped to **CWE-798 — Use of Hard-coded Credentials**. These findings correspond to generic API keys and JWT tokens embedded directly in source files and git history — including `data/static/users.yml`, `lib/insecurity.ts`, and `routes/login.ts`.
+The Gitleaks import surfaced **9 active findings** within this engagement, all classified **High severity** and mapped to **CWE-798 — Use of Hard-coded Credentials**. These findings correspond to generic API keys and JWT tokens embedded directly in source files and git history — including `data/static/users.yml`, `lib/insecurity.ts`, and `routes/login.ts`.
 
 > **CWE-798** — *Use of Hard-coded Credentials:* The software contains hard-coded credentials, such as a password or cryptographic key, which it uses for its own inbound authentication, outbound communication to external components, or encryption of internal data.
 
@@ -277,7 +277,7 @@ Semgrep identified a **CWE-89 SQL Injection** vulnerability at **Finding ID 115*
 
 #### Medium Severity Findings — Express.js Security Misconfigurations (Semgrep)
 
-Beyond the critical SQL Injection finding, Semgrep's `p/javascript` ruleset flagged **26 Medium severity** findings across the Express.js application layer. All findings originate from the **Semgrep JSON Report** import, totalling **41 open findings** across the product (`demo.defectdojo.org/product/2/finding/open?page_size=150`).
+Beyond the critical SQL Injection finding, Semgrep's `p/javascript` ruleset flagged **17 Medium severity** findings across the Express.js application layer. All findings originate from the **Semgrep JSON Report** import.
 
 These findings represent a class of application-layer misconfigurations commonly exploited in Express.js APIs — each mapped to a specific Semgrep rule and line reference in the codebase:
 
@@ -293,7 +293,7 @@ These findings represent a class of application-layer misconfigurations commonly
 
 **Key observations:**
 - Multiple rules fire across repeated code patterns (e.g., `express-res-sendfile` and `express-path-join-resolve` appear at the same lines across several route files), indicating systemic misuse of Express primitives rather than isolated incidents.
-- `express-jwt-not-revoked` at line 522 indicates that issued JWT tokens remain valid indefinitely — there is no server-side token blacklist or revocation mechanism in place, which is a known authentication bypass risk.
+- `express-jwt-not-revoked` at line 522 indicates that issued JWT tokens remain valid indefinitely — there is no server-side token blacklist or revocation mechanism, which is a known authentication bypass risk.
 - `express-ssrf` at line 918 suggests that user-controlled input influences outbound HTTP requests, potentially enabling attackers to proxy requests to internal services or cloud metadata endpoints.
 - `express-insecure-template-usage` at line 1336 indicates user-controlled data is rendered via a template engine without sanitisation — a prerequisite condition for Server-Side Template Injection (SSTI).
 
@@ -315,7 +315,7 @@ These findings represent a class of application-layer misconfigurations commonly
 
 ---
 
-### Stage 2 — Pre-Commit Secret Scanning (Local Defence Layer)
+### Pre-Commit Hook — Local Secret Scanning
 
 To intercept secrets **before** they enter the git history, a git pre-commit hook executes gitleaks locally on every `git commit`. This represents the earliest possible enforcement point in the development workflow — upstream of the CI pipeline — where remediation is least costly.
 
@@ -370,7 +370,8 @@ chmod +x .git/hooks/pre-commit
 | **Shift Left** | Pre-commit hook and parallel CI scans intercept vulnerabilities before code reaches production |
 | **Defence in Depth** | Three independent security tools (`gitleaks`, `njsscan`, `semgrep`) cover distinct vulnerability classes |
 | **Gated Delivery** | `build_image` is blocked until all scan and test jobs complete (`needs: [yarn_test, gitleaks, njsscan, semgrep]`) |
-| **Audit Trail** | SARIF reports from `gitleaks` and `njsscan` are uploaded to GitHub Security, providing persistent per-commit vulnerability records |
+| **Automated Reporting** | `upload_reports` pushes all scan artefacts to DefectDojo on every run, eliminating manual import and ensuring findings are immediately visible in the risk register |
+| **Audit Trail** | SARIF reports from `njsscan` are uploaded to GitHub Security Code Scanning; all three reports are preserved as pipeline artefacts and imported into DefectDojo |
 | **Reproducibility** | All jobs execute in isolated, purpose-built containers, eliminating environment drift across pipeline runs |
 | **Build Efficiency** | Dependency caching in `create_cache` keyed to `yarn.lock` eliminates redundant installs across downstream jobs |
 
