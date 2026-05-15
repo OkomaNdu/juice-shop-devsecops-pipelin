@@ -72,22 +72,59 @@ This project implements a **DevSecOps CI pipeline** using [GitHub Actions](https
 
 ### Pipeline Architecture
 
-```
-git push
-    │
-    ├── create_cache      ← Installs and caches dependencies (node_modules / .yarn)
-    │       │
-    │   yarn_test ────────────────────────────────────────────────────────┐
-    │                                                                      │
-    ├── gitleaks ─────────────────────────────────────────┬───────────────┤
-    ├── njsscan  ─────────────────────────────────────────┤               │
-    ├── semgrep  ─────────────────────────────────────────┤               │
-    │                                                     │               │
-    │                                            upload_reports      build_image
-    │                                            (→ DefectDojo API)  (→ Docker Hub)
+```mermaid
+flowchart TD
+    DEV(["Developer Workstation"])
+
+    DEV -->|"git commit"| HOOK["Pre-Commit Hook\n.git/hooks/pre-commit\ngitleaks detect --source /path --verbose"]
+    HOOK -->|"Secrets detected — exit 1"| BLK(["Commit Blocked"])
+    HOOK -->|"No secrets found"| PUSH(["git push → GitHub Actions"])
+
+    PUSH --> CC
+    PUSH --> GL
+    PUSH --> NJ
+    PUSH --> SG
+
+    subgraph S1["Stage 1 — Parallel Security Scanning & Test Execution"]
+        CC["create_cache\nnode:18-bullseye\nInstall & cache node_modules / .yarn\nCache key: yarn.lock hash"]
+        CC --> YT["yarn_test\nnode:18-bullseye\nRun unit test suite"]
+        GL["gitleaks\nzricethezav/gitleaks:latest\nSecret detection across full git history\ncontinue-on-error: true"]
+        NJ["njsscan\najinabraham/njsscan-action@master\nNode.js SAST · SARIF output"]
+        SG["semgrep\nsemgrep/semgrep · ruleset: p/javascript\nMulti-rule static analysis\ncontinue-on-error: true"]
+    end
+
+    GL -->|"gitleaks.json · if: always()"| ART
+    NJ -->|"results.sarif · if: always()"| ART
+    NJ -->|"codeql-action/upload-sarif"| GCS(["GitHub Code Scanning"])
+    SG -->|"semgrep.json · if: always()"| ART
+
+    ART[("GitHub Actions Artifact Store\n─────────────────────────────\ngitleaks-report  ~2.17 KB\nnjsscan.sarif    ~422 B\nsemgrep.json     ~8.48 KB")]
+
+    ART --> UR
+    GL --> UR
+    NJ --> UR
+    SG --> UR
+
+    YT --> BI
+    GL --> BI
+    NJ --> BI
+    SG --> BI
+
+    subgraph S2["Stage 2 — Automated Reporting & Delivery"]
+        UR["upload_reports\npython:3\nneeds: gitleaks · njsscan · semgrep\ndownload-artifact × 3\nupload-report.py × 3"]
+        BI["build_image\ndocker:24 + DinD\nneeds: yarn_test · gitleaks · njsscan · semgrep\ndocker build → docker push"]
+    end
+
+    UR -->|"POST /api/v2/import-scan/\nAuthorization: Token DEFECTDOJO_API_KEY\nengagement: 6 · active: true · verified: true"| DD
+    BI -->|"docker push"| DH
+
+    DD[("DefectDojo\ndemo.defectdojo.org\n─────────────────────────────\nEngagement ID 6 · release 1.1.0\n32 Active Findings\nHigh: 15 · Medium: 17")]
+    DH[("Docker Hub\n─────────────────────────────\nndubuisip/demo-app:juice-shop-1.2")]
 ```
 
-![CI Pipeline Run](screenshots/sast-ci-pipeline.png)
+Pipeline run #57 (`ci-upload-reports` branch) — **Status: Success | Duration: 9m 14s | Artifacts: 3**. `gitleaks` and `semgrep` exit with non-zero codes as expected (secrets and SAST findings detected), but `continue-on-error: true` ensures `upload_reports` and `build_image` proceed unblocked.
+
+![CI Pipeline Run — upload_reports](screenshots/ci-upload-reports-pipeline.png)
 
 ### Job Reference
 
@@ -116,8 +153,6 @@ All three security scanning jobs are configured to persist their output reports 
 | `semgrep.json` | `semgrep` | JSON | ~8.48 KB | Multi-language static analysis findings including rule metadata, severity, and affected code location |
 
 Artefacts are accessible from the **GitHub Actions run summary → Artifacts** section and are available for download for the duration of the configured retention period.
-
-![Scan Report Artifacts](screenshots/scan-report-artifacts.png)
 
 ---
 
@@ -214,7 +249,7 @@ data = {
 
 Following a successful pipeline run, all three scan reports are imported into engagement ID 6 — **release version 1.1.0** — on the **juice-shop** product in DefectDojo. The engagement is scoped to a 7-day CI/CD window (15th–22nd May) and was created 22 minutes after the pipeline run, with the upload completing 19 minutes after creation.
 
-The screenshot below confirms the automated import via `upload_reports`. All findings are immediately marked **active and verified**, consistent with `active: True` and `verified: True` set in `upload-report.py`:
+All findings are immediately marked **active and verified**, consistent with `active: True` and `verified: True` set in `upload-report.py`:
 
 | Title / Type | Date | Total Findings | Active (Verified / Fixable) | Mitigated | Duplicates |
 |---|---|---|---|---|---|
@@ -224,7 +259,7 @@ The screenshot below confirms the automated import via `upload_reports`. All fin
 
 **Engagement total: 32 active findings | Critical: 0 | High: 15 | Medium: 17 | Low: 0**
 
-![DefectDojo Engagement Overview](screenshots/defectdojo-engagement.png)
+![DefectDojo Engagement — release version 1.1.0](screenshots/defectdojo-engagement.png)
 
 ---
 
@@ -241,8 +276,6 @@ The Gitleaks import surfaced **9 active findings** within this engagement, all c
 - Rotate all exposed keys and JWT signing secrets immediately
 - Rewrite git history to purge secrets from prior commits
 - Enforce gitleaks pre-commit hooks across all developer workstations to prevent recurrence
-
-![DefectDojo Open Findings - CWE-798](screenshots/defectdojo-findings-cwe798.png)
 
 ---
 
@@ -269,10 +302,6 @@ Semgrep identified a **CWE-89 SQL Injection** vulnerability at **Finding ID 115*
 - Apply input validation and allowlisting at the route handler level
 - Enforce Semgrep's `p/javascript` ruleset in CI as a mandatory blocking gate (remove `continue-on-error: true`) once the baseline findings are remediated
 
-![DefectDojo CWE-89 Finding Detail](screenshots/defectdojo-finding-cwe89.png)
-
-![CWE-89 MITRE Definition](screenshots/defectdojo-cwe89-mitre.png)
-
 ---
 
 #### Medium Severity Findings — Express.js Security Misconfigurations (Semgrep)
@@ -296,10 +325,6 @@ These findings represent a class of application-layer misconfigurations commonly
 - `express-jwt-not-revoked` at line 522 indicates that issued JWT tokens remain valid indefinitely — there is no server-side token blacklist or revocation mechanism, which is a known authentication bypass risk.
 - `express-ssrf` at line 918 suggests that user-controlled input influences outbound HTTP requests, potentially enabling attackers to proxy requests to internal services or cloud metadata endpoints.
 - `express-insecure-template-usage` at line 1336 indicates user-controlled data is rendered via a template engine without sanitisation — a prerequisite condition for Server-Side Template Injection (SSTI).
-
-![DefectDojo Semgrep Medium Findings - Page 1](screenshots/defectdojo-semgrep-medium-1.png)
-
-![DefectDojo Semgrep Medium Findings - Page 2](screenshots/defectdojo-semgrep-medium-2.png)
 
 ---
 
