@@ -139,11 +139,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: semgrep.json
+      - name: Download retire.json
+        uses: actions/download-artifact@v4
+        with:
+          name: retire.json
       - run: pip install requests
       - run: python3 upload-report.py gitleaks.json
       - run: python3 upload-report.py njsscan.sarif
-      - run: python3 upload-report.py semgrep.json      
-      - run: python3 upload-report.py retire.json      
+      - run: python3 upload-report.py semgrep.json
+      - run: python3 upload-report.py retire.json     
 
   build_image:  # ← needs 2 spaces indent
     runs-on: ubuntu-latest
