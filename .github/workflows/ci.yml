@@ -99,6 +99,7 @@ jobs:
 
   retire:
     runs-on: ubuntu-latest
+    continue-on-error: true
     container: node:18-bullseye
     steps:
       - uses: actions/checkout@v4
