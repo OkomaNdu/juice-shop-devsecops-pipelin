@@ -303,6 +303,69 @@ Semgrep identified a **CWE-89 SQL Injection** vulnerability at **Finding ID 115*
 
 ---
 
+#### Remediation Applied — CWE-89 SQL Injection Fix
+
+Following the Semgrep scan, the SQL injection vulnerability was investigated in DefectDojo. **Finding ID 148** — flagged by the `javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection` rule — confirmed the root cause: a Sequelize query in `data/static/codefixes/dbSchemaChallenge_3.ts` at line 11 was constructing SQL using direct string concatenation of the user-supplied `criteria` parameter.
+
+| Field | Value |
+|---|---|
+| Finding ID | 148 |
+| CWE | CWE-89 — Improper Neutralisation of Special Elements in SQL Commands |
+| Severity | High |
+| Status | Active, Verified |
+| Scanner | Semgrep JSON Report |
+| File | `data/static/codefixes/dbSchemaChallenge_3.ts` |
+| Line | 11 |
+| Rule | `javascript.sequelize.security.audit.sequelize-injection-express.express-sequelize-injection` |
+| Similar Findings | 62 |
+
+> **Semgrep description:** *Detected a Sequelize statement that is tainted by user-input. This could lead to SQL injection if the variable is user-controlled and is not properly sanitised. In order to prevent SQL injection, it is recommended to use parameterised queries or prepared statements.*
+
+![DefectDojo — Finding 148 SQL Injection Detail](screenshots/defectdojo-sqli-finding.png)
+
+**Vulnerable code — before fix:**
+
+The query directly interpolated the `criteria` variable into the SQL string using string concatenation, allowing an attacker to inject arbitrary SQL through the search input:
+
+```typescript
+models.sequelize.query(
+  "SELECT * FROM Products WHERE ((name LIKE '%" + criteria + "%' OR description LIKE '%" + criteria + "%') AND deletedAt IS NULL) ORDER BY name"
+)
+```
+
+**Fixed code — after remediation:**
+
+The string concatenation was replaced with a Sequelize named replacement parameter (`:searchQuery`). The `criteria` value is bound through the `replacements` object and never interpolated directly into the SQL string, eliminating the injection vector:
+
+```typescript
+models.sequelize.query(
+  "SELECT * FROM Products WHERE ((name LIKE :searchQuery OR description LIKE :searchQuery) AND deletedAt IS NULL) ORDER BY name",
+  {
+    replacements: { searchQuery: '%' + criteria + '%' },
+    type: models.Sequelize.QueryTypes.SELECT
+  }
+)
+```
+
+**Why this fix is effective:** Sequelize's `replacements` mechanism passes the bound value through the database driver's parameterisation layer. The SQL statement is compiled and sent to the database engine separately from the user-supplied value — the engine treats the replacement as a literal data value and not executable SQL, regardless of its content.
+
+**Pipeline re-run post-fix:** After committing the remediation, the CI pipeline executed a second import into the DefectDojo engagement. The updated engagement view (6 tests across 2 pipeline runs) reflects the reduction — the second Semgrep JSON Report import recorded **22 active findings**, down from 23 on the initial run, confirming the patched finding was no longer detected by the rule.
+
+| Run | Scan Type | Total Findings | Active |
+|---|---|---|---|
+| Run 1 (pre-fix) | Gitleaks Scan | 9 | 9 (9/0) |
+| Run 1 (pre-fix) | Semgrep JSON Report | 23 | 23 (23/0) |
+| Run 1 (pre-fix) | nodejsscan Scan (SARIF) | 0 | 0 (0/0) |
+| Run 2 (post-fix) | Gitleaks Scan | 9 | 9 (9/0) |
+| Run 2 (post-fix) | Semgrep JSON Report | 22 | 22 (22/0) |
+| Run 2 (post-fix) | nodejsscan Scan (SARIF) | 0 | 0 (0/0) |
+
+**Engagement total after both runs: 63 active findings | Critical: 0 | High: 29 | Medium: 34 | Low: 0**
+
+![DefectDojo — Engagement Post-Fix Re-Run](screenshots/defectdojo-engagement-post-fix.png)
+
+---
+
 #### Medium Severity Findings — Express.js Security Misconfigurations (Semgrep)
 
 Beyond the critical SQL Injection finding, Semgrep's `p/javascript` ruleset flagged **17 Medium severity** findings across the Express.js application layer. All findings originate from the **Semgrep JSON Report** import.
