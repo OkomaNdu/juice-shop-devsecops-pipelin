@@ -2,7 +2,7 @@ name: CI
 
 on: [push]
 
-env: 
+env:
   IMAGE_NAME: ndubuisip/demo-app
   IMAGE_TAG: juice-shop-1.2
 
@@ -12,13 +12,17 @@ jobs:
     container: node:18-bullseye
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - name: Restore cache
+        id: cache-restore
+        uses: actions/cache@v4
         with:
           path: |
             node_modules
             .yarn
           key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
-      - run: yarn install
+      - name: Install dependencies (cache miss only)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: yarn install
 
   yarn_test:
     runs-on: ubuntu-latest
@@ -46,25 +50,36 @@ jobs:
         with:
           fetch-depth: 0
       - run: git config --global --add safe.directory $GITHUB_WORKSPACE
-      - run: gitleaks detect --source . --verbose
+      - run: gitleaks detect --source . --verbose -f json -r gitleaks.json
+      - name: Upload gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks.json
 
   njsscan:
     runs-on: ubuntu-latest
-    continue-on-error: true
     permissions:
       security-events: write
     steps:
       - name: Checkout the code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: nodejsscan scan
         id: njsscan
         uses: ajinabraham/njsscan-action@master
         with:
           args: '. --sarif --output results.sarif --exit-warning'
       - name: Upload njsscan report
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
+      - name: Save njsscan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: njsscan.sarif
+          path: results.sarif
 
   semgrep:
     runs-on: ubuntu-latest
@@ -74,11 +89,43 @@ jobs:
       SEMGREP_RULES: p/javascript
     steps:
       - uses: actions/checkout@v4
-      - run: semgrep ci        
+      - run: semgrep ci --json --output semgrep.json
+      - name: Save semgrep artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep.json
+          path: semgrep.json 
 
-  build_image:
+  upload_reports:
     runs-on: ubuntu-latest
-    needs: [yarn_test, gitleaks]
+    needs: [gitleaks, njsscan, semgrep]
+    container: python:3
+    env:
+      DEFECTDOJO_API_KEY: ${{ vars.DEFECTDOJO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download gitleaks report
+        uses: actions/download-artifact@v4
+        with:
+          name: gitleaks-report
+      - name: Download njsscan.sarif
+        uses: actions/download-artifact@v4
+        with:
+          name: njsscan.sarif
+      - run: mv results.sarif njsscan.sarif
+      - name: Download semgrep.json
+        uses: actions/download-artifact@v4
+        with:
+          name: semgrep.json
+      - run: pip install requests
+      - run: python3 upload-report.py gitleaks.json
+      - run: python3 upload-report.py njsscan.sarif
+      - run: python3 upload-report.py semgrep.json            
+
+  build_image:  # ← needs 2 spaces indent
+    runs-on: ubuntu-latest
+    needs: [yarn_test, gitleaks, njsscan, semgrep]
     container: docker:24
     services:
       docker:
@@ -91,5 +138,3 @@ jobs:
       - run: docker login -u $DOCKER_USER -p $DOCKER_PASS
       - run: docker build -t $IMAGE_NAME:$IMAGE_TAG .
       - run: docker push $IMAGE_NAME:$IMAGE_TAG
-
-
