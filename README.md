@@ -40,6 +40,8 @@ For a detailed introduction, full list of features and architecture overview ple
 
 - [CI Pipeline](#ci-pipeline)
 - [Vulnerability Management: DefectDojo](#vulnerability-management-defectdojo)
+  - [Software Composition Analysis — Retire.js](#software-composition-analysis--retirejs)
+  - [Challenges Using SCA](#challenges-using-sca)
 - [Setup](#setup)
     - [From Sources](#from-sources)
     - [Packaged Distributions](#packaged-distributions)
@@ -64,10 +66,119 @@ For a detailed introduction, full list of features and architecture overview ple
 
 ## CI Pipeline
 
-This project implements a **DevSecOps CI pipeline** using [GitHub Actions](https://github.com/features/actions), integrating automated security controls directly into the software delivery lifecycle. The pipeline is triggered on every `git push` and orchestrates seven jobs across two execution stages:
+This project implements a **DevSecOps CI pipeline** using [GitHub Actions](https://github.com/features/actions), integrating automated security controls directly into the software delivery lifecycle. The pipeline is triggered on every `git push` and orchestrates eight jobs across two execution stages:
 
-- **Stage 1 — Parallel security scanning and test execution:** `create_cache`, `yarn_test`, `gitleaks`, `njsscan`, and `semgrep` run concurrently, maximising feedback speed.
+- **Stage 1 — Parallel security scanning and test execution:** `create_cache`, `yarn_test`, `gitleaks`, `njsscan`, `semgrep`, and `retire` run concurrently, maximising feedback speed. The `retire` job performs **Software Composition Analysis (SCA)**, scanning all third-party dependencies for known CVEs.
 - **Stage 2 — Gated delivery and automated reporting:** `upload_reports` automatically imports scan artefacts into DefectDojo via REST API; `build_image` builds and pushes the Docker image to the registry. Both run in parallel once Stage 1 completes.
+
+---
+
+### Pipeline Security Coverage
+
+This pipeline enforces a **three-layer security model** at every code push, covering the full attack surface of a Node.js web application — from developer credentials to application logic to third-party supply chain risk. Each layer is implemented as an independent CI job using a purpose-built tool, ensuring that a failure or finding in one layer does not suppress the output of another.
+
+---
+
+#### Layer 1 — Hardcoded Secret Detection (Gitleaks)
+
+**Tool:** [Gitleaks](https://github.com/gitleaks/gitleaks) | **Job:** `gitleaks` | **Output:** `gitleaks.json`
+
+Secrets committed to source code — API keys, JWT signing secrets, database passwords, access tokens — represent one of the most critical and irreversible security failures in software development. Once pushed to a remote repository, a hardcoded secret is permanently embedded in git history and must be treated as compromised, regardless of subsequent deletion from the codebase.
+
+The `gitleaks` job addresses this at two points in the delivery lifecycle:
+
+**1. Pre-commit (developer workstation):**
+A Gitleaks pre-commit hook is installed at `.git/hooks/pre-commit` and executes before every `git commit`. It scans the staged changeset for secret patterns — including generic API keys, private keys, AWS credentials, GitHub tokens, and JWT secrets — and blocks the commit with a non-zero exit code if any are detected. This enforces a **shift-left** control: secrets are caught before they ever reach the remote repository.
+
+```bash
+# .git/hooks/pre-commit
+gitleaks detect --source . --verbose
+```
+
+**2. CI pipeline (full history scan):**
+The `gitleaks` CI job runs against the full git history (`fetch-depth: 0`) using the official `zricethezav/gitleaks:latest` Docker image. This catches any secrets that bypassed the pre-commit hook — committed without the hook installed, pushed from a fork, or present in historical commits before the hook was introduced. The full-history scan is the definitive control; the pre-commit hook is the fast-feedback layer.
+
+```
+Scan scope:   Full git history (all branches, all commits)
+Output:       gitleaks.json — rule ID, file path, line number, commit SHA, entropy score
+Severity:     All findings are HIGH — CWE-798 (Use of Hard-coded Credentials)
+Action:       continue-on-error: true — findings are reported but do not block delivery
+```
+
+**What was found:** The Gitleaks scan detected **9 active findings** in this repository — all High severity, all mapped to CWE-798. Findings include JWT signing secrets in `lib/insecurity.ts`, generic API keys in `data/static/users.yml`, and password literals in `routes/login.ts`. These are intentionally present in OWASP Juice Shop as part of its deliberate vulnerability design, and serve to validate that the scanner is working correctly against a known-vulnerable target.
+
+---
+
+#### Layer 2 — Application Code Security (SAST: njsscan + Semgrep)
+
+**Tools:** [njsscan](https://github.com/ajinabraham/njsscan) + [Semgrep](https://semgrep.dev) | **Jobs:** `njsscan`, `semgrep` | **Outputs:** `results.sarif`, `semgrep.json`
+
+Static Application Security Testing (SAST) analyses application source code without executing it, identifying insecure coding patterns, dangerous API usage, and vulnerability classes such as injection, path traversal, and authentication weaknesses. Two complementary SAST tools run in parallel to maximise rule coverage:
+
+**njsscan — Node.js-specific SAST:**
+
+njsscan uses a semantic grep-based engine purpose-built for Node.js and JavaScript applications. It understands Express.js routing patterns, security-sensitive APIs, and common misconfigurations in Node.js server code. Output is produced in SARIF format and uploaded to **GitHub Security Code Scanning**, making findings visible directly in the repository's Security tab alongside Dependabot alerts.
+
+```
+Scan scope:   All JavaScript/TypeScript source files in the repository
+Rule engine:  Semantic grep (Node.js-aware patterns)
+Output:       results.sarif → GitHub Code Scanning + njsscan.sarif pipeline artifact
+Coverage:     XSS, SSRF, path traversal, insecure crypto, command injection, JWT misuse
+```
+
+**Semgrep — Multi-rule static analysis:**
+
+Semgrep applies the `p/javascript` community ruleset — a curated set of 100+ rules covering OWASP Top 10 vulnerability classes across JavaScript and TypeScript. Rules fire on abstract syntax tree (AST) patterns rather than text matching, reducing false positives and catching vulnerabilities that span multiple lines or use indirect variable assignment.
+
+```
+Scan scope:   All JavaScript/TypeScript source files in the repository
+Rule engine:  AST pattern matching (p/javascript ruleset)
+Output:       semgrep.json pipeline artifact → imported into DefectDojo
+Coverage:     SQL injection, open redirect, SSRF, SSTI, JWT token revocation,
+              path traversal, directory listing, insecure file serving
+```
+
+**What was found:** Semgrep detected **22–23 active findings** per run, including a confirmed **CWE-89 SQL Injection** in `data/static/codefixes/dbSchemaChallenge_3.ts` (raw string concatenation into a Sequelize query — since remediated), and **17 Medium severity** Express.js misconfigurations spanning SSRF, open redirect, path traversal, insecure template rendering (SSTI precondition), and JWT tokens accepted without revocation checks. njsscan produced 0 findings, reflecting its tighter Node.js-specific rule scope against this codebase.
+
+---
+
+#### Layer 3 — Dependency Security / Supply Chain Risk (SCA: Retire.js)
+
+**Tool:** [Retire.js](https://retirejs.github.io/retire.js/) | **Job:** `retire` | **Output:** `retire.json`
+
+Modern Node.js applications depend on hundreds of third-party packages — and the security of the application is only as strong as the security of every package in its dependency tree. **Software Composition Analysis (SCA)** scans these packages against databases of known vulnerabilities, surfacing CVEs that exist not in the application's own code but in the libraries it relies on.
+
+The `retire` job installs Retire.js globally and scans the full project directory, matching every JavaScript file and installed package against the Retire.js vulnerability database. This includes not just direct dependencies listed in `package.json`, but also **transitive dependencies** — packages that direct dependencies depend upon — which are often the source of undetected risk.
+
+```
+Scan scope:   All node_modules — direct and transitive dependencies
+Database:     Retire.js curated CVE/vulnerability database (community-maintained)
+Output:       retire.json — component name, version, CVE identifiers, CWE, affected range
+Severity:     High and Medium findings across Lodash, jQuery, underscore.js
+Action:       continue-on-error: true — findings reported but do not block delivery
+```
+
+**What was found:** Retire.js detected **23 findings** — dominated by High severity **Prototype Pollution** and **Command Injection** vulnerabilities in `lodash 2.4.2`, and a High severity **Arbitrary Code Injection** (CWE-94) in `underscore.js 1.7.0` via the `template` function (CVE-2021-23358). Medium severity findings include multiple `jQuery 2.1.x` vulnerabilities covering XSS via `parseHTML()`, CORS execution, and regex-based XSS in `htmlPrefilter`. None of these packages are imported directly by this application — all are transitive dependencies pulled in by other packages, illustrating the depth of supply chain exposure in a real-world Node.js project.
+
+---
+
+#### End-to-End: From Scan to Vulnerability Management
+
+All findings from all three layers are automatically imported into **DefectDojo** on every pipeline run by the `upload_reports` job. DefectDojo provides a centralised vulnerability register with CWE taxonomy mapping, severity-based prioritisation, remediation tracking, and engagement-scoped reporting — converting raw CI scan output into an auditable, actionable risk register without any manual intervention.
+
+```
+Gitleaks  → gitleaks.json  → DefectDojo scan_type: "Gitleaks Scan"
+njsscan   → njsscan.sarif  → DefectDojo scan_type: "SARIF"
+Semgrep   → semgrep.json   → DefectDojo scan_type: "Semgrep JSON Report"
+Retire.js → retire.json    → DefectDojo scan_type: "Retire.js Scan"
+
+Engagement: juice-shop / release version 1.1
+Total active findings: 148 | High: 68 | Medium: 79 | Low: 1
+```
+
+The `build_image` job is gated behind all scan jobs (`needs: [yarn_test, gitleaks, njsscan, semgrep]`), ensuring no Docker image is produced until the full security scan suite has completed. The Docker image is published to Docker Hub only when all upstream gates pass.
+
+---
 
 ### Pipeline Architecture
 
@@ -83,6 +194,7 @@ flowchart TD
     PUSH --> GL
     PUSH --> NJ
     PUSH --> SG
+    PUSH --> RT
 
     subgraph S1["Stage 1 — Parallel Security Scanning & Test Execution"]
         CC["create_cache\nnode:18-bullseye\nInstall & cache node_modules / .yarn\nCache key: yarn.lock hash"]
@@ -90,19 +202,22 @@ flowchart TD
         GL["gitleaks\nzricethezav/gitleaks:latest\nSecret detection across full git history\ncontinue-on-error: true"]
         NJ["njsscan\najinabraham/njsscan-action@master\nNode.js SAST · SARIF output"]
         SG["semgrep\nsemgrep/semgrep · ruleset: p/javascript\nMulti-rule static analysis\ncontinue-on-error: true"]
+        RT["retire\nnode:18-bullseye\nnpm install -g retire\nSCA · retire.json output\ncontinue-on-error: true"]
     end
 
     GL -->|"gitleaks.json · if: always()"| ART
     NJ -->|"results.sarif · if: always()"| ART
     NJ -->|"codeql-action/upload-sarif"| GCS(["GitHub Code Scanning"])
     SG -->|"semgrep.json · if: always()"| ART
+    RT -->|"retire.json · if: always()"| ART
 
-    ART[("GitHub Actions Artifact Store\n─────────────────────────────\ngitleaks-report  ~2.17 KB\nnjsscan.sarif    ~422 B\nsemgrep.json     ~8.48 KB")]
+    ART[("GitHub Actions Artifact Store\n─────────────────────────────\ngitleaks-report  ~2.17 KB\nnjsscan.sarif    ~422 B\nsemgrep.json     ~8.48 KB\nretire.json      SCA findings")]
 
     ART --> UR
     GL --> UR
     NJ --> UR
     SG --> UR
+    RT --> UR
 
     YT --> BI
     GL --> BI
@@ -110,20 +225,20 @@ flowchart TD
     SG --> BI
 
     subgraph S2["Stage 2 — Automated Reporting & Delivery"]
-        UR["upload_reports\npython:3\nneeds: gitleaks · njsscan · semgrep\ndownload-artifact × 3\nupload-report.py × 3"]
+        UR["upload_reports\npython:3\nneeds: gitleaks · njsscan · semgrep · retire\ndownload-artifact × 4\nupload-report.py × 4"]
         BI["build_image\ndocker:24 + DinD\nneeds: yarn_test · gitleaks · njsscan · semgrep\ndocker build → docker push"]
     end
 
-    UR -->|"POST /api/v2/import-scan/\nAuthorization: Token DEFECTDOJO_API_KEY\nengagement: 6 · active: true · verified: true"| DD
+    UR -->|"POST /api/v2/import-scan/\nAuthorization: Token DEFECTDOJO_API_KEY\nengagement: 4 · active: true · verified: true"| DD
     BI -->|"docker push"| DH
 
-    DD[("DefectDojo\ndemo.defectdojo.org\n─────────────────────────────\nEngagement ID 6 · release 1.1.0\n32 Active Findings\nHigh: 15 · Medium: 17")]
+    DD[("DefectDojo\ndemo.defectdojo.org\n─────────────────────────────\nEngagement ID 4 · release version 1.1\n148 Active Findings\nHigh: 68 · Medium: 79 · Low: 1")]
     DH[("Docker Hub\n─────────────────────────────\nndubuisip/demo-app:juice-shop-1.2")]
 ```
 
-Pipeline run #57 (`ci-upload-reports` branch) — **Status: Success | Duration: 9m 14s | Artifacts: 3**. `gitleaks` and `semgrep` exit with non-zero codes as expected (secrets and SAST findings detected), but `continue-on-error: true` ensures `upload_reports` and `build_image` proceed unblocked.
+Pipeline run #70 (`security-composition-analysis` branch) — **Status: Success | Duration: 9m 7s | Artifacts: 4**. `gitleaks`, `semgrep`, and `retire` exit with non-zero codes as expected (secrets, SAST findings, and vulnerable dependencies detected), but `continue-on-error: true` ensures `upload_reports` and `build_image` proceed unblocked.
 
-![CI Pipeline Run — upload_reports](screenshots/ci-upload-reports-pipeline.png)
+![CI Pipeline Run #70 — retire job added](screenshots/ci-retire-pipeline.png)
 
 ### Job Reference
 
@@ -134,14 +249,15 @@ Pipeline run #57 (`ci-upload-reports` branch) — **Status: Success | Duration: 
 | `gitleaks` | `zricethezav/gitleaks:latest` | On every push (`continue-on-error: true`) | `gitleaks.json` uploaded as pipeline artifact |
 | `njsscan` | `ajinabraham/njsscan-action@master` | On every push | `results.sarif` uploaded to GitHub Code Scanning + `njsscan.sarif` artifact |
 | `semgrep` | `semgrep/semgrep` | On every push (`continue-on-error: true`) | `semgrep.json` uploaded as pipeline artifact |
-| `upload_reports` | `python:3` | `needs: [gitleaks, njsscan, semgrep]` | `gitleaks.json`, `njsscan.sarif`, `semgrep.json` imported into DefectDojo via REST API |
+| `retire` | `node:18-bullseye` | On every push (`continue-on-error: true`) | `retire.json` uploaded as pipeline artifact — SCA findings for all third-party dependencies |
+| `upload_reports` | `python:3` | `needs: [gitleaks, njsscan, semgrep, retire]` | `gitleaks.json`, `njsscan.sarif`, `semgrep.json`, `retire.json` imported into DefectDojo via REST API |
 | `build_image` | `docker:24` (DinD) | `needs: [yarn_test, gitleaks, njsscan, semgrep]` | `ndubuisip/demo-app:juice-shop-1.2` pushed to Docker Hub |
 
 ---
 
 ### Scan Report Artefacts
 
-All three security scanning jobs are configured to persist their output reports as downloadable pipeline artefacts using `actions/upload-artifact@v4`. Reports are uploaded unconditionally via `if: always()`, ensuring they are retained regardless of whether the scan job passes or fails. This enables offline triage, integration with external vulnerability management platforms, and audit trail preservation beyond the GitHub Actions log retention window.
+All four security scanning jobs are configured to persist their output reports as downloadable pipeline artefacts using `actions/upload-artifact@v4`. Reports are uploaded unconditionally via `if: always()`, ensuring they are retained regardless of whether the scan job passes or fails. This enables offline triage, integration with external vulnerability management platforms, and audit trail preservation beyond the GitHub Actions log retention window.
 
 **Artefacts produced per pipeline run:**
 
@@ -150,6 +266,7 @@ All three security scanning jobs are configured to persist their output reports 
 | `gitleaks-report` | `gitleaks` | JSON | ~2.17 KB | Full secret detection output including rule ID, file, line, commit, and entropy per finding |
 | `njsscan.sarif` | `njsscan` | SARIF | ~422 Bytes | Node.js SAST findings in SARIF format, compatible with GitHub Code Scanning and external tooling |
 | `semgrep.json` | `semgrep` | JSON | ~8.48 KB | Multi-language static analysis findings including rule metadata, severity, and affected code location |
+| `retire.json` | `retire` | JSON | varies | SCA findings — all third-party dependencies scanned against Retire.js vulnerability database, with CVE identifiers, affected versions, and CWE classifications per finding |
 
 Artefacts are accessible from the **GitHub Actions run summary → Artifacts** section and are available for download for the duration of the configured retention period.
 
@@ -157,7 +274,7 @@ Artefacts are accessible from the **GitHub Actions run summary → Artifacts** s
 
 ### Vulnerability Management: DefectDojo
 
-Scan artefacts produced by Gitleaks, Semgrep, and njsscan are automatically imported into **DefectDojo** — an open-source vulnerability management platform — on every pipeline run via a dedicated `upload_reports` CI job. This eliminates manual report handling, providing a centralised, deduplicated, and auditable vulnerability register that is updated continuously with every code push.
+Scan artefacts produced by Gitleaks, Semgrep, njsscan, and Retire.js are automatically imported into **DefectDojo** — an open-source vulnerability management platform — on every pipeline run via a dedicated `upload_reports` CI job. This eliminates manual report handling, providing a centralised, deduplicated, and auditable vulnerability register that is updated continuously with every code push.
 
 #### Accessing DefectDojo
 
@@ -193,21 +310,23 @@ Navigate to **http://localhost:8080** and log in with `admin` and the password r
 
 #### Automated Report Upload — `upload_reports` Job
 
-The `upload_reports` job runs in a `python:3` container and executes only after `gitleaks`, `njsscan`, and `semgrep` have all completed (`needs: [gitleaks, njsscan, semgrep]`). It downloads the three scan artefacts from the GitHub Actions artefact store and imports each one into DefectDojo via the REST API.
+The `upload_reports` job runs in a `python:3` container and executes only after `gitleaks`, `njsscan`, `semgrep`, and `retire` have all completed (`needs: [gitleaks, njsscan, semgrep, retire]`). It downloads the four scan artefacts from the GitHub Actions artefact store and imports each one into DefectDojo via the REST API.
 
 **Job sequence:**
 
 ```
 gitleaks ──┐
 njsscan  ──┼──► upload_reports (python:3)
-semgrep  ──┘         │
-                     ├── download gitleaks-report   → gitleaks.json
+semgrep  ──┤         │
+retire   ──┘         ├── download gitleaks-report   → gitleaks.json
                      ├── download njsscan.sarif     → njsscan.sarif
                      ├── download semgrep.json      → semgrep.json
+                     ├── download retire.json       → retire.json
                      ├── pip install requests
                      ├── python3 upload-report.py gitleaks.json
                      ├── python3 upload-report.py njsscan.sarif
-                     └── python3 upload-report.py semgrep.json
+                     ├── python3 upload-report.py semgrep.json
+                     └── python3 upload-report.py retire.json
                                   │
                                   └──► POST /api/v2/import-scan/ → DefectDojo
 ```
@@ -223,6 +342,7 @@ The `upload-report.py` script accepts a single filename argument (`sys.argv[1]`)
 | `gitleaks.json` | `Gitleaks Scan` |
 | `njsscan.sarif` | `SARIF` |
 | `semgrep.json` | `Semgrep JSON Report` |
+| `retire.json` | `Retire.js Scan` |
 
 **API call configuration:**
 
@@ -234,31 +354,40 @@ data = {
     'verified':         True,
     'scan_type':        scan_type,      # mapped from filename
     'minimum_severity': 'Low',
-    'engagement':       6               # targets engagement ID 6
+    'engagement':       4               # targets engagement ID 4
 }
 ```
 
 - `active: True` — findings are immediately marked active in the risk register
 - `verified: True` — findings are pre-marked as verified, bypassing manual triage for known scanner output
 - `minimum_severity: 'Low'` — all severity levels are ingested; no findings are filtered at import
-- `engagement: 6` — all reports are imported into a pre-configured DefectDojo engagement, scoping findings to the correct product and release window
+- `engagement: 4` — all reports are imported into a pre-configured DefectDojo engagement, scoping findings to the correct product and release window
 - A HTTP `201 Created` response confirms successful import; any other status code prints the response body for debugging
 
 #### Engagement Findings Summary
 
-Following a successful pipeline run, all three scan reports are imported into engagement ID 6 — **release version 1.1.0** — on the **juice-shop** product in DefectDojo. The engagement is scoped to a 7-day CI/CD window (15th–22nd May) and was created 22 minutes after the pipeline run, with the upload completing 19 minutes after creation.
+Following a successful pipeline run, all four scan reports are imported into engagement ID 4 — **release version 1.1** — on the **juice-shop** product in DefectDojo. The engagement is scoped to a 7-day CI/CD window (15th–22nd May) and accumulates findings across multiple pipeline runs triggered by successive commits on the `security-composition-analysis` branch.
 
-All findings are immediately marked **active and verified**, consistent with `active: True` and `verified: True` set in `upload-report.py`:
+All findings are immediately marked **active and verified**, consistent with `active: True` and `verified: True` set in `upload-report.py`. With the addition of Retire.js SCA, the engagement now surfaces **148 active findings** across 13 tests from multiple pipeline runs:
 
 | Title / Type | Date | Total Findings | Active (Verified / Fixable) | Mitigated | Duplicates |
 |---|---|---|---|---|---|
 | Gitleaks Scan | May 15, 2026 | 9 | 9 (9 / 0) | 0 | 0 |
+| Gitleaks Scan | May 15, 2026 | 9 | 9 (9 / 0) | 0 | 0 |
+| Gitleaks Scan | May 15, 2026 | 9 | 9 (9 / 0) | 0 | 0 |
+| Gitleaks Scan | May 15, 2026 | 9 | 9 (9 / 0) | 0 | 0 |
+| Retire.js Scan | May 15, 2026 | 23 | 23 (23 / 0) | 0 | 0 |
+| Semgrep JSON Report | May 15, 2026 | 22 | 22 (22 / 0) | 0 | 0 |
+| Semgrep JSON Report | May 15, 2026 | 22 | 22 (22 / 0) | 0 | 0 |
+| Semgrep JSON Report | May 15, 2026 | 22 | 22 (22 / 0) | 0 | 0 |
 | Semgrep JSON Report | May 15, 2026 | 23 | 23 (23 / 0) | 0 | 0 |
 | nodejsscan Scan (SARIF) | May 15, 2026 | 0 | 0 (0 / 0) | 0 | 0 |
 
-**Engagement total: 32 active findings | Critical: 0 | High: 15 | Medium: 17 | Low: 0**
+**Engagement total: 148 active findings | Critical: 0 | High: 68 | Medium: 79 | Low: 1**
 
-![DefectDojo Engagement — release version 1.1.0](screenshots/defectdojo-engagement.png)
+> **Note on duplicate test entries:** Each pipeline run creates a new test record within the same engagement. Multiple commits on the same branch produce multiple Gitleaks Scan and Semgrep JSON Report entries. DefectDojo deduplication operates at the finding level within a test, not across tests — this is a known SCA/SAST integration challenge covered in the [Challenges using SCA](#challenges-using-sca) section below.
+
+![DefectDojo Engagement — release version 1.1 — 148 findings](screenshots/defectdojo-engagement-retire.png)
 
 ---
 
@@ -390,6 +519,118 @@ These findings represent a class of application-layer misconfigurations commonly
 
 ---
 
+#### Software Composition Analysis — Retire.js
+
+The `retire` job integrates **Retire.js** into the CI pipeline as a dedicated **Software Composition Analysis (SCA)** tool. Unlike SAST tools (njsscan, semgrep) that analyse custom application code, SCA focuses entirely on **third-party dependencies** — scanning every package in `node_modules` against Retire.js's curated database of known vulnerabilities indexed by CVE identifier.
+
+**How the job runs:**
+
+```yaml
+retire:
+  runs-on: ubuntu-latest
+  continue-on-error: true
+  container: node:18-bullseye
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/cache@v4          # restore cached node_modules
+    - run: npm install -g retire
+    - run: retire --path . --outputformat json --outputpath retire.json
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: retire.json
+        path: retire.json
+```
+
+Retire.js scans the project directory recursively, matching all JavaScript files and installed packages against its vulnerability signatures. The `--outputformat json` flag produces structured output suitable for automated ingestion into DefectDojo.
+
+#### Retire.js Findings — SCA Results
+
+The Retire.js scan surfaced **23 findings** across the dependency tree, dominated by **High severity** vulnerabilities in widely-used packages present as transitive dependencies:
+
+**Representative High severity findings:**
+
+| Vulnerability | Package | Version | CVE | CWE |
+|---|---|---|---|---|
+| Prototype Pollution | `lodash` | 2.4.2 | multiple | CWE-1035 |
+| Command Injection | `lodash` | 2.4.2 | multiple | CWE-1035 |
+| Arbitrary Code Injection via template function | `underscore.js` | 1.7.0 | CVE-2021-23358 | CWE-94 |
+
+**Representative Medium severity findings:**
+
+| Vulnerability | Package | Version | CVE | CWE |
+|---|---|---|---|---|
+| Prototype Pollution | `lodash` | 2.4.2 (various) | multiple | CWE-1035 |
+| `parseHTML()` Executes Scripts in Event Handlers | `jquery` | 2.1.x | multiple | CWE-1035 |
+| 3rd Party CORS Request May Execute | `jquery` | 2.1.0 | multiple | CWE-1035 |
+| `jQuery.before 3.4.0` used in Drupal, Backdrop CMS | `jquery` | 2.1.x | multiple | CWE-1035 |
+| Regex in `jQuery.htmlPrefilter` May Introduce XSS | `jquery` | 2.1.x | multiple | CWE-1035 |
+
+**Key finding — underscore.js 1.7.0 (CVE-2021-23358 / CWE-94):**
+
+Finding ID 263 is a representative Retire.js result showing the depth of transitive dependency risk. The vulnerable file is `node_modules/fast.js/dist/bench.js` — a file not written by this project, in a dependency of a dependency. `underscore.js 1.7.0` (vulnerable: `>=1.3.2 <1.12.1`) is bundled by `fast.js` and exposes an **Arbitrary Code Injection** vector via its `template` function (CWE-94 — Code Injection).
+
+| Field | Value |
+|---|---|
+| Finding ID | 263 |
+| Severity | High |
+| Component | `underscore.js` 1.7.0 |
+| Location | `node_modules/fast.js/dist/bench.js` |
+| CVE | CVE-2021-23358 |
+| CWE | CWE-94 — Improper Control of Generation of Code |
+| GHSA | GHSA-cf4h-3jhx-xvhq |
+| Vulnerable range | `>=1.3.2 <1.12.1` |
+| Scanner | Retire.js Scan |
+
+> **CWE-94** — *Improper Control of Generation of Code ("Code Injection"): The software constructs all or part of a code segment using externally-influenced input from an upstream component, but it does not neutralise or incorrectly neutralises special elements that could modify the syntax or behaviour of the intended code segment.*
+
+**Recommended remediation:**
+- Update `lodash` to `>=4.17.21` where it appears as a direct or transitive dependency
+- Update `jquery` to `>=3.5.0`
+- Upgrade `fast.js` to a version that bundles `underscore.js >=1.12.1`, or replace with a maintained alternative
+- Run `npm audit fix` or `yarn upgrade` to pull in patched versions of transitive dependencies
+- Pin dependency version ranges in `package.json` to prevent silent upgrades to vulnerable versions
+
+![DefectDojo — Retire.js findings list (Lodash, jQuery, underscore.js)](screenshots/defectdojo-retire-findings-list.png)
+
+![DefectDojo — Finding 263 underscore.js CWE-94 detail](screenshots/defectdojo-retire-finding-263.png)
+
+---
+
+#### Challenges Using SCA
+
+Integrating Software Composition Analysis into a CI pipeline using Retire.js and DefectDojo exposed several practical challenges that are common across SCA implementations:
+
+**1. Transitive dependency noise**
+
+The majority of Retire.js findings originate from **transitive dependencies** — packages that the application does not import directly but which are pulled in by direct dependencies. `lodash 2.4.2` and `underscore.js 1.7.0` are not in `package.json`; they are bundled by other packages. This makes remediation indirect: the fix requires upgrading the parent package, which may introduce breaking changes, or waiting for the upstream maintainer to patch their bundled dependency.
+
+**2. False positives from benchmark and test files**
+
+The `underscore.js` finding at `node_modules/fast.js/dist/bench.js` is a benchmark file — code that is never executed in production and exists purely for performance testing of the `fast.js` library. Retire.js cannot distinguish between production bundle files and development/test/benchmark artefacts within `node_modules`, producing findings for files that pose no runtime risk to deployed users. Without suppression rules or path-based exclusions, the noise obscures genuinely exploitable vulnerabilities.
+
+**3. No EPSS score or exploit availability data**
+
+Retire.js reports CVE identifiers and CWE classifications, but provides no **EPSS (Exploit Prediction Scoring System)** percentile or evidence of active exploitation. As seen in the DefectDojo findings view, the EPSS Score and EPSS Percentile columns show `N.A.` for all Retire.js findings. This makes it difficult to prioritise — a critical CVE with no known exploit may be less urgent than a medium CVE that is actively weaponised in the wild.
+
+**4. Duplicate findings across pipeline runs**
+
+Because `upload_reports` posts to DefectDojo's `/api/v2/import-scan/` endpoint on every push, each pipeline run creates a new **test record** within the same engagement. DefectDojo's deduplication engine merges identical findings *within* a test but not across tests from separate runs. After multiple commits on the `security-composition-analysis` branch, the engagement accumulated 13 test entries (4 × Gitleaks, 4 × Semgrep, 4 × Retire.js, 1 × nodejsscan), inflating the total finding count from the true 23 unique SCA findings to a cumulative 148. Mitigation strategies include using DefectDojo's `reimport-scan` endpoint instead of `import-scan` for subsequent runs, or scoping each engagement to a single pipeline run.
+
+**5. Retire.js database coverage gaps**
+
+Retire.js's vulnerability database is community-maintained and focused on JavaScript packages. Vulnerabilities that have not yet been indexed (zero-days, newly disclosed CVEs with no Retire.js entry) will not be detected. Complementing Retire.js with `npm audit` or a commercial SCA tool (e.g., Snyk, Dependabot) improves coverage, particularly for the npm ecosystem's own advisory database.
+
+**6. Version range ambiguity**
+
+Retire.js matches packages by name and version against ranges such as `>=1.3.2 <1.12.1`. When multiple versions of the same package exist in the dependency tree (common in large projects), each version is evaluated independently. A project may appear partially patched — one consumer of `lodash` upgraded, another still on a vulnerable version — producing repeated findings for the same CVE across different paths in `node_modules`.
+
+**7. CI gate configuration**
+
+`continue-on-error: true` is set on the `retire` job to prevent SCA findings from blocking the pipeline. This is a pragmatic decision when introducing SCA for the first time against a project with an established vulnerability baseline. However, it means the pipeline reports overall success even when high-severity dependency vulnerabilities are present. A mature SCA gate would enforce a severity threshold (e.g., fail on Critical or weaponised High CVEs) once the baseline is triaged and suppressed.
+
+---
+
 #### DefectDojo Integration Value
 
 | Capability | Benefit |
@@ -408,10 +649,11 @@ These findings represent a class of application-layer misconfigurations commonly
 | Principle | Implementation |
 |---|---|
 | **Shift Left** | Pre-commit hook and parallel CI scans intercept vulnerabilities before code reaches production |
-| **Defence in Depth** | Three independent security tools (`gitleaks`, `njsscan`, `semgrep`) cover distinct vulnerability classes |
+| **Defence in Depth** | Four independent security tools (`gitleaks`, `njsscan`, `semgrep`, `retire`) cover distinct vulnerability classes: secrets, SAST, multi-rule static analysis, and SCA |
+| **Software Composition Analysis** | `retire` scans all third-party dependencies against the Retire.js CVE database on every push, surfacing known vulnerabilities in the full dependency tree including transitive packages |
 | **Gated Delivery** | `build_image` is blocked until all scan and test jobs complete (`needs: [yarn_test, gitleaks, njsscan, semgrep]`) |
-| **Automated Reporting** | `upload_reports` pushes all scan artefacts to DefectDojo on every run, eliminating manual import and ensuring findings are immediately visible in the risk register |
-| **Audit Trail** | SARIF reports from `njsscan` are uploaded to GitHub Security Code Scanning; all three reports are preserved as pipeline artefacts and imported into DefectDojo |
+| **Automated Reporting** | `upload_reports` pushes all four scan artefacts to DefectDojo on every run, eliminating manual import and ensuring findings are immediately visible in the risk register |
+| **Audit Trail** | SARIF reports from `njsscan` are uploaded to GitHub Security Code Scanning; all four reports are preserved as pipeline artefacts and imported into DefectDojo |
 | **Reproducibility** | All jobs execute in isolated, purpose-built containers, eliminating environment drift across pipeline runs |
 | **Build Efficiency** | Dependency caching in `create_cache` keyed to `yarn.lock` eliminates redundant installs across downstream jobs |
 
