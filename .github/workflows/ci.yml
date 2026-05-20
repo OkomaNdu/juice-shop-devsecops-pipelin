@@ -177,6 +177,8 @@ jobs:
     needs: [yarn_test, gitleaks, njsscan, semgrep, build_image]
     steps:
       - uses: actions/checkout@v4
+      - name: Set IMAGE_NAME                  
+        run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - run: apt update -y && apt install openssh-client -y
       - run: |
           eval $(ssh-agent -s)
