@@ -7,7 +7,10 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ vars.AWS_SECRET_ACCESS_KEY }}
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
   IMAGE_NAME: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
+  SERVER_IP: 18.221.101.228
+  SERVER_USER: ubuntu
 
 jobs:
   create_cache:
@@ -163,3 +166,22 @@ jobs:
       - run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
       - run: docker push $IMAGE_NAME:${{ github.sha }}
       - run: docker push $IMAGE_NAME:latest
+
+  deploy_image:
+    runs-on: ubuntu-latest
+    container: debian:bulleseye-slim   
+    needs: [yarn_test, gitleaks, njsscan, semgrep, build_image]
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt update -y && apt install openssh-client -y
+      - run: |
+          eval $(ssh-agent -s)
+          echo "$SSH_PRIVATE_KEY" > /tmp/deploy_key
+          chmod 400 /tmp/deploy_key     
+          ssh-add /tmp/deploy_key          
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker pull $IMAGE_NAME:latest"       
+          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker stop juice-shop || true && docker rm juice-shop || true"
+          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker run -d --name juice-shop -p 3000:3000 $IMAGE_NAME:latest"
+          rm /tmp/deploy_key
