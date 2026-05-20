@@ -8,7 +8,8 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
   SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-  IMAGE_NAME: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
+  # FIX: Evaluates variables cleanly via Context Syntax
+  IMAGE_NAME: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_DEFAULT_REGION }}.amazonaws.com/juice-shop
   SERVER_IP: 18.221.101.228
   SERVER_USER: ubuntu
 
@@ -128,67 +129,44 @@ jobs:
           name: retire.json
           path: retire.json         
 
-  # upload_reports:
-    # runs-on: ubuntu-latest
-    # needs: [gitleaks, njsscan, semgrep, retire]
-    # container: python:3
-    # env:
-    #  DEFECTDOJO_API_KEY: ${{ vars.DEFECTDOJO_API_KEY }}
-    # steps:
-      #- uses: actions/checkout@v4
-      #- name: Download gitleaks report
-      #  uses: actions/download-artifact@v4
-      #  with:
-      #    name: gitleaks-report
-      #- name: Download njsscan.sarif
-      #  uses: actions/download-artifact@v4
-      #  with:
-      #    name: njsscan.sarif
-      #- run: mv results.sarif njsscan.sarif
-      #- name: Download semgrep.json
-      #  uses: actions/download-artifact@v4
-     #   with:
-      #    name: semgrep.json
-     # - name: Download retire.json
-    #    uses: actions/download-artifact@v4
-    #    with:
-    #      name: retire.json
-    #  - run: pip install requests
-    #  - run: python3 upload-report.py gitleaks.json
-    #  - run: python3 upload-report.py njsscan.sarif
-    #  - run: python3 upload-report.py semgrep.json
-    #  - run: python3 upload-report.py retire.json     
-
   build_image:
     runs-on: ubuntu-latest
     needs: [yarn_test, gitleaks, njsscan, semgrep]
     steps:
       - uses: actions/checkout@v4
-      - name: Set IMAGE_NAME
-        run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
-      - run: aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-      - run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
-      - run: docker push $IMAGE_NAME:${{ github.sha }}
-      - run: docker push $IMAGE_NAME:latest
+      
+      # FIX: Authenticates runner context safely with AWS before docker commands run
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
+          docker push $IMAGE_NAME:${{ github.sha }}
+          docker push $IMAGE_NAME:latest
 
   deploy_image:
     runs-on: ubuntu-latest
-    container: debian:bullseye-slim 
     needs: [yarn_test, gitleaks, njsscan, semgrep, build_image]
     steps:
       - uses: actions/checkout@v4
-      - name: Set IMAGE_NAME                  
-        run: ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
-      - run: apt update -y && apt install openssh-client -y
-      - run: |
-          eval $(ssh-agent -s)
-          echo "$SSH_PRIVATE_KEY" > /tmp/deploy_key
-          chmod 400 /tmp/deploy_key     
-          ssh-add /tmp/deploy_key          
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker pull $IMAGE_NAME:latest"       
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker stop juice-shop || true && docker rm juice-shop || true"
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker run -d --name juice-shop -p 3000:3000 $IMAGE_NAME:latest"
-          rm /tmp/deploy_key
+      - name: Setup SSH Key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Deploy to Server via SSH
+        run: |
+          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "
+            aws ecr get-login-password --region ${{ env.AWS_DEFAULT_REGION }} | docker login --username AWS --password-stdin $IMAGE_NAME || true
+            docker pull $IMAGE_NAME:latest
+            docker stop juice-shop || true && docker rm juice-shop || true
+            docker run -d --name juice-shop -p 3000:3000 $IMAGE_NAME:latest
+          "
