@@ -164,7 +164,7 @@ jobs:
       - name: Install AWS CLI
         run: |
           apk --no-cache add python3 py3-pip
-          pip3 install --no-cache-dir awscli
+          pip3 install --no-cache-dir --break-system-packages awscli
       - name: Set IMAGE_NAME
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - run: aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
