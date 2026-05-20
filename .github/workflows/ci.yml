@@ -167,7 +167,7 @@ jobs:
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
           ./aws/install
-          echo "/usr/local/bin" >> $GITHUB_PATH
+          ln -sf /usr/local/bin/aws /usr/bin/aws
       - name: Set IMAGE_NAME
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - run: aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
