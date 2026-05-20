@@ -161,13 +161,13 @@ jobs:
         image: docker:24-dind
     steps:
       - uses: actions/checkout@v4
-      - name: Install AWS CLI
+      - name: Login to ECR
         run: |
           apk --no-cache add curl unzip
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
           ./aws/install
-          ln -sf /usr/local/bin/aws /usr/bin/aws
+          /usr/local/bin/aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - name: Set IMAGE_NAME
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - run: aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
