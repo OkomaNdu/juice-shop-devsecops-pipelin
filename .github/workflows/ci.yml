@@ -178,7 +178,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set IMAGE_NAME                  
-        run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
+        run: ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
       - run: apt update -y && apt install openssh-client -y
       - run: |
           eval $(ssh-agent -s)
