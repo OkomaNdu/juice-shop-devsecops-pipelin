@@ -38,6 +38,9 @@ For a detailed introduction, full list of features and architecture overview ple
 
 ## Table of contents
 
+- [CI Pipeline](#ci-pipeline)
+  - [Pipeline Jobs](#pipeline-jobs)
+  - [Building and Pushing the Image to AWS ECR](#building-and-pushing-the-image-to-aws-ecr)
 - [Setup](#setup)
     - [From Sources](#from-sources)
     - [Packaged Distributions](#packaged-distributions)
@@ -59,6 +62,75 @@ For a detailed introduction, full list of features and architecture overview ple
 - [Donations](#donations)
 - [Contributors](#contributors)
 - [Licensing](#licensing)
+
+## CI Pipeline
+
+This project runs a **DevSecOps CI pipeline** defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) using [GitHub Actions](https://github.com/features/actions). The pipeline is triggered on every `git push` (`on: [push]`) and runs security scanning and testing jobs in parallel before building and publishing a Docker image.
+
+### Pipeline Jobs
+
+| Job | Container / Action | Trigger Condition | Output |
+|---|---|---|---|
+| `create_cache` | `node:18-bullseye` | On every push | Caches `node_modules` / `.yarn` keyed to the `yarn.lock` hash |
+| `yarn_test` | `node:18-bullseye` | `needs: create_cache` | Runs `yarn install` and `yarn test` |
+| `gitleaks` | `zricethezav/gitleaks:latest` | On every push (`continue-on-error: true`) | Secret detection across full git history → `gitleaks.json` artifact |
+| `njsscan` | `ajinabraham/njsscan-action@master` | On every push | Node.js SAST → `results.sarif` uploaded to GitHub Code Scanning + `njsscan.sarif` artifact |
+| `semgrep` | `semgrep/semgrep` (ruleset `p/javascript`) | On every push (`continue-on-error: true`) | Static analysis → `semgrep.json` artifact |
+| `retire` | `node:18-bullseye` | On every push (`continue-on-error: true`) | Software Composition Analysis → `retire.json` artifact |
+| `build_image` | `ubuntu-latest` | `needs: [yarn_test, gitleaks, njsscan, semgrep]` | Builds the Docker image and pushes it to AWS ECR |
+
+The `build_image` job is gated behind `yarn_test`, `gitleaks`, `njsscan`, and `semgrep` — no image is built or pushed until those jobs complete.
+
+The pipeline flow below shows Stage 1 security/test jobs running in parallel, followed by `yarn_test` → `build_image`:
+
+![CI pipeline flow — GitHub Actions run](screenshots/ci-ecr-pipeline.png)
+
+### Building and Pushing the Image to AWS ECR
+
+The `build_image` job builds the Juice Shop Docker image and publishes it to a private **Amazon Elastic Container Registry (ECR)** repository named `juice-shop`.
+
+**AWS configuration**
+
+The workflow reads the following AWS settings from GitHub Actions repository variables and exposes them as environment variables:
+
+| Environment variable | Source |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | `vars.AWS_ACCESS_KEY_ID` |
+| `AWS_SECRET_ACCESS_KEY` | `vars.AWS_SECRET_ACCESS_KEY` |
+| `AWS_ACCOUNT_ID` | `vars.AWS_ACCOUNT_ID` |
+| `AWS_DEFAULT_REGION` | `vars.AWS_DEFAULT_REGION` |
+
+The image name is constructed from these values:
+
+```
+$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
+```
+
+**Build and push steps**
+
+1. **Checkout** — `actions/checkout@v4` checks out the repository.
+2. **Set `IMAGE_NAME`** — the fully qualified ECR image name is written to `$GITHUB_ENV`:
+   ```bash
+   echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
+   ```
+3. **Authenticate to ECR** — a registry login token is requested and piped into `docker login`:
+   ```bash
+   aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+   ```
+4. **Build the image** — the image is built and tagged twice: with the commit SHA and with `latest`:
+   ```bash
+   docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
+   ```
+5. **Push both tags** — both tags are pushed to the ECR repository:
+   ```bash
+   docker push $IMAGE_NAME:${{ github.sha }}
+   docker push $IMAGE_NAME:latest
+   ```
+
+Each pipeline run therefore publishes an immutable, commit-pinned image (`:<git-sha>`) alongside a moving `:latest` tag in the `juice-shop` ECR repository:
+
+![AWS ECR — juice-shop repository images](screenshots/ecr-juice-shop-images.png)
+
 
 ## Setup
 
