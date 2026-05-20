@@ -81,6 +81,10 @@ This project runs a **DevSecOps CI pipeline** defined in [`.github/workflows/ci.
 
 The `build_image` job is gated behind `yarn_test`, `gitleaks`, `njsscan`, and `semgrep` — no image is built or pushed until those jobs complete.
 
+The pipeline flow below shows Stage 1 security/test jobs running in parallel, followed by `yarn_test` → `build_image`:
+
+![CI pipeline flow — GitHub Actions run](screenshots/ci-ecr-pipeline.png)
+
 ### Building and Pushing the Image to AWS ECR
 
 The `build_image` job builds the Juice Shop Docker image and publishes it to a private **Amazon Elastic Container Registry (ECR)** repository named `juice-shop`.
@@ -123,7 +127,9 @@ $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
    docker push $IMAGE_NAME:latest
    ```
 
-Each pipeline run therefore publishes an immutable, commit-pinned image (`:<git-sha>`) alongside a moving `:latest` tag in the `juice-shop` ECR repository.
+Each pipeline run therefore publishes an immutable, commit-pinned image (`:<git-sha>`) alongside a moving `:latest` tag in the `juice-shop` ECR repository:
+
+![AWS ECR — juice-shop repository images](screenshots/ecr-juice-shop-images.png)
 
 
 ## Setup
