@@ -134,19 +134,23 @@ jobs:
     needs: [yarn_test, gitleaks, njsscan, semgrep]
     steps:
       - uses: actions/checkout@v4
-      
-      # FIX: Authenticates runner context safely with AWS before docker commands run
+      - uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            .yarn
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_DEFAULT_REGION }}
-
       - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-
+      - name: Ensure packages exist
+        run: yarn install --prefer-offline
       - name: Build and Push Docker Image
         run: |
           docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
