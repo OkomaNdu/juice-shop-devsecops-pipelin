@@ -15,9 +15,10 @@ RUN rm data/chatbot/botDefaultTrainingData.json || true
 RUN rm ftp/legal.md || true
 RUN rm i18n/*.json || true
 
-FROM node:18-bookworm-slim
+FROM gcr.io/distroless/nodejs:18
 WORKDIR /juice-shop
 COPY --from=installer --chown=65532:0 /juice-shop .
 USER 65532
 EXPOSE 3000
 CMD ["/juice-shop/build/app.js"]
+
