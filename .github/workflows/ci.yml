@@ -160,13 +160,14 @@ jobs:
     #  - run: python3 upload-report.py retire.json     
 
   build_image:
-    runs-on: [self-hosted, Linux, X64, tags]
+    runs-on: [self-hosted, juice-shop]
     needs: [yarn_test, gitleaks, njsscan, semgrep]
     steps:
       - uses: actions/checkout@v4
       - name: Set IMAGE_NAME
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
-      - run: aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - name: Log in to ECR
+        run: aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
       - run: docker push $IMAGE_NAME:${{ github.sha }}
       - run: docker push $IMAGE_NAME:latest
