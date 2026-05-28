@@ -41,6 +41,16 @@ For a detailed introduction, full list of features and architecture overview ple
 - [CI Pipeline](#ci-pipeline)
   - [Pipeline Jobs](#pipeline-jobs)
   - [Building and Pushing the Image to AWS ECR](#building-and-pushing-the-image-to-aws-ecr)
+- [Release Deployment](#release-deployment)
+  - [Provisioning the Application EC2 Instance (`juice-app-server`)](#provisioning-the-application-ec2-instance-juice-app-server)
+  - [Installing Docker and the AWS CLI](#installing-docker-and-the-aws-cli)
+  - [Authenticating to Amazon ECR](#authenticating-to-amazon-ecr)
+  - [Verifying the Deployed Container](#verifying-the-deployed-container)
+- [Self-Hosted GitHub Actions Runner](#self-hosted-github-actions-runner)
+  - [Provisioning the Runner EC2 Instance (`self-hosted-runner`)](#provisioning-the-runner-ec2-instance-self-hosted-runner)
+  - [Registering the Runner with GitHub](#registering-the-runner-with-github)
+  - [Installing Build Tooling on the Runner](#installing-build-tooling-on-the-runner)
+  - [Running the Runner as a Service](#running-the-runner-as-a-service)
 - [Setup](#setup)
     - [From Sources](#from-sources)
     - [Packaged Distributions](#packaged-distributions)
@@ -63,74 +73,275 @@ For a detailed introduction, full list of features and architecture overview ple
 - [Contributors](#contributors)
 - [Licensing](#licensing)
 
+
+
+
 ## CI Pipeline
 
-This project runs a **DevSecOps CI pipeline** defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) using [GitHub Actions](https://github.com/features/actions). The pipeline is triggered on every `git push` (`on: [push]`) and runs security scanning and testing jobs in parallel before building and publishing a Docker image.
+The pipeline is defined in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) and triggers on
+every `push`. It is organised as a fan-out of independent quality and
+security gates after a shared dependency-cache stage, followed by a
+sequential build-and-release fan-in:
+
+```
+                 ┌─► yarn_test ─┐
+                 ├─► gitleaks ──┤
+ create_cache ──►┼─► njsscan ───┼──► build_image ──► deploy_image
+                 ├─► semgrep ───┤
+                 └─► retire ────┘
+```
 
 ### Pipeline Jobs
 
-| Job | Container / Action | Trigger Condition | Output |
-|---|---|---|---|
-| `create_cache` | `node:18-bullseye` | On every push | Caches `node_modules` / `.yarn` keyed to the `yarn.lock` hash |
-| `yarn_test` | `node:18-bullseye` | `needs: create_cache` | Runs `yarn install` and `yarn test` |
-| `gitleaks` | `zricethezav/gitleaks:latest` | On every push (`continue-on-error: true`) | Secret detection across full git history → `gitleaks.json` artifact |
-| `njsscan` | `ajinabraham/njsscan-action@master` | On every push | Node.js SAST → `results.sarif` uploaded to GitHub Code Scanning + `njsscan.sarif` artifact |
-| `semgrep` | `semgrep/semgrep` (ruleset `p/javascript`) | On every push (`continue-on-error: true`) | Static analysis → `semgrep.json` artifact |
-| `retire` | `node:18-bullseye` | On every push (`continue-on-error: true`) | Software Composition Analysis → `retire.json` artifact |
-| `build_image` | `ubuntu-latest` | `needs: [yarn_test, gitleaks, njsscan, semgrep]` | Builds the Docker image and pushes it to AWS ECR |
+Each job runs in its own container (or on the self-hosted runner for
+`build_image`) so failures are isolated and tool versions are pinned.
 
-The `build_image` job is gated behind `yarn_test`, `gitleaks`, `njsscan`, and `semgrep` — no image is built or pushed until those jobs complete.
+| Job             | Runner                          | Purpose                                                            | Failure policy           |
+|-----------------|---------------------------------|--------------------------------------------------------------------|--------------------------|
+| `create_cache`  | `ubuntu-latest` (`node:18-bullseye`) | Restores or hydrates the `node_modules` + `.yarn` cache keyed by `yarn.lock` so downstream jobs skip a full install. | Blocks pipeline on failure |
+| `yarn_test`     | `ubuntu-latest` (`node:18-bullseye`) | Installs deps (cache hit) and runs `yarn test` — the Juice Shop unit suite. | Blocks `build_image`     |
+| `gitleaks`      | `ubuntu-latest` (`zricethezav/gitleaks`) | Scans the full git history (`fetch-depth: 0`) for committed secrets; uploads `gitleaks.json` artifact. | `continue-on-error: true` — reported, non-blocking |
+| `njsscan`       | `ubuntu-latest`                 | Node.js-specific SAST via `ajinabraham/njsscan-action`; uploads SARIF to GitHub code scanning and as an artifact. | Blocks `build_image` on warnings |
+| `semgrep`       | `ubuntu-latest` (`semgrep/semgrep`) | Generic SAST using the `p/javascript` ruleset; uploads `semgrep.json`. | `continue-on-error: true` |
+| `retire`        | `ubuntu-latest` (`node:18-bullseye`) | `retire.js` scan for known-vulnerable JavaScript dependencies; uploads `retire.json`. | `continue-on-error: true` |
+| `build_image`   | `self-hosted, juice-shop`       | Builds the Docker image and pushes both `:${{ github.sha }}` and `:latest` to ECR. | Blocks `deploy_image`    |
+| `deploy_image`  | `ubuntu-latest` (`debian:bullseye-slim`) | SSHes into the application EC2 host, pulls the new `:latest` tag and recreates the `juice-shop` container. | Final stage              |
 
-The pipeline flow below shows Stage 1 security/test jobs running in parallel, followed by `yarn_test` → `build_image`:
+The recent successful runs ([`#103`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/26548881468),
+[`#104`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/26549793818))
+show the expected steady-state behaviour: `gitleaks`, `semgrep` and
+`retire` report findings (visible in the Annotations panel) but
+`continue-on-error: true` keeps them from blocking the release, while
+`yarn_test` and `njsscan` must pass for `build_image` to start.
 
-![CI pipeline flow — GitHub Actions run](screenshots/ci-ecr-pipeline.png)
+![CI run #103 — full pipeline, 15m 7s end-to-end](screenshots/release-pipeline-run.png)
+
+The re-run (`#104`) demonstrates the value of the registry-based
+build cache enabled in commit `d3b03ba` — total duration drops from
+**15m 7s → 4m 44s**, with `build_image` falling from `10m 44s` to `8s`
+because every Docker layer hits cache:
+
+![CI run #104 — re-run benefits from registry build cache, 4m 44s end-to-end](screenshots/release-pipeline-run-1.png)
+
+#### Caching strategy
+
+`create_cache` exists purely so the four downstream Node.js jobs
+(`yarn_test`, `retire`, and indirectly any future Node-based gate) share
+a single hydrated `node_modules`/`.yarn` directory keyed by
+`hashFiles('yarn.lock')`. The cache key rolls automatically whenever
+`yarn.lock` changes, and the `if: steps.cache-restore.outputs.cache-hit
+!= 'true'` guard ensures the `yarn install` only runs on a real miss.
+
+#### Scan reports as artifacts
+
+Every security gate uploads its raw report as a workflow artifact
+(`gitleaks-report`, `njsscan.sarif`, `semgrep.json`, `retire.json`).
+The commented-out `upload_reports` job in `ci.yml` is the hook for
+forwarding those artifacts into DefectDojo for centralised triage —
+enable it once the `DEFECTDOJO_API_KEY` repository variable is set.
 
 ### Building and Pushing the Image to AWS ECR
 
-The `build_image` job builds the Juice Shop Docker image and publishes it to a private **Amazon Elastic Container Registry (ECR)** repository named `juice-shop`.
+`build_image` runs on the [self-hosted runner](#self-hosted-github-actions-runner)
+because the Juice Shop Docker build is heavier than what GitHub-hosted
+runners can comfortably accommodate. The steps:
 
-**AWS configuration**
+1. Check out the source.
+2. Resolve the ECR image name from the `AWS_ACCOUNT_ID` and
+   `AWS_DEFAULT_REGION` repository variables:
+   `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/juice-shop`.
+3. Authenticate Docker to ECR via
+   `aws ecr get-login-password | docker login --username AWS --password-stdin …`.
+4. Build the image tagged with both the commit SHA (immutable, auditable)
+   and `latest` (the tag the application host pulls).
+5. Push both tags to ECR.
 
-The workflow reads the following AWS settings from GitHub Actions repository variables and exposes them as environment variables:
+The SHA tag lets us pin a known-good build for rollback; `latest` is the
+moving pointer the `deploy_image` stage consumes.
 
-| Environment variable | Source |
-|---|---|
-| `AWS_ACCESS_KEY_ID` | `vars.AWS_ACCESS_KEY_ID` |
-| `AWS_SECRET_ACCESS_KEY` | `vars.AWS_SECRET_ACCESS_KEY` |
-| `AWS_ACCOUNT_ID` | `vars.AWS_ACCOUNT_ID` |
-| `AWS_DEFAULT_REGION` | `vars.AWS_DEFAULT_REGION` |
+The deployment stage and the bootstrap of the application host are
+documented in [Release Deployment](#release-deployment) below.
 
-The image name is constructed from these values:
+## Release Deployment
 
+The release stage of the pipeline (`build_image` → `deploy_image` in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the Juice Shop
+Docker image on a self-hosted runner, pushes it to Amazon ECR
+(`991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop`), and SSHs into
+a dedicated EC2 application server to pull the new `:latest` tag and
+recreate the running container.
+
+This section documents the one-time bootstrap performed on the target EC2
+host so that the pipeline's `deploy_image` job has everything it needs to
+land a release.
+
+### Provisioning the Application EC2 Instance (`juice-app-server`)
+
+A `t2.micro` Ubuntu 26.04 LTS EC2 instance named **`juice-app-server`** was
+created in `us-east-2`. The Security Group exposes:
+
+| Port | Source     | Purpose                          |
+|------|------------|----------------------------------|
+| 22   | Admin IP   | SSH bootstrap & pipeline deploy  |
+| 3000 | `0.0.0.0/0` | Juice Shop HTTP                 |
+
+Connect to the instance from the workstation using the downloaded key
+pair:
+
+```bash
+chmod 400 ~/Downloads/app-server-key.pem
+ssh -i ~/Downloads/app-server-key.pem ubuntu@<EC2_PUBLIC_IP>
 ```
-$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
+
+> The same public IP must be set as `SERVER_IP` in
+> [`.github/workflows/ci.yml`](.github/workflows/ci.yml) so that the
+> `deploy_image` job can reach it.
+
+### Installing Docker and the AWS CLI
+
+The deploy job assumes Docker is running on the target host and that the
+`ubuntu` user can talk to the Docker daemon without `sudo`:
+
+```bash
+sudo apt update
+sudo apt install -y docker.io awscli
+sudo usermod -aG docker ubuntu
+# log out and back in so the new group membership takes effect
+exit
 ```
 
-**Build and push steps**
+After re-connecting, confirm `docker ps` works without `sudo` — if it
+still returns `permission denied while trying to connect to the docker
+API`, the SSH session was started before the group change was applied; a
+fresh `ssh` login resolves it.
 
-1. **Checkout** — `actions/checkout@v4` checks out the repository.
-2. **Set `IMAGE_NAME`** — the fully qualified ECR image name is written to `$GITHUB_ENV`:
-   ```bash
-   echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
-   ```
-3. **Authenticate to ECR** — a registry login token is requested and piped into `docker login`:
-   ```bash
-   aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-   ```
-4. **Build the image** — the image is built and tagged twice: with the commit SHA and with `latest`:
-   ```bash
-   docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
-   ```
-5. **Push both tags** — both tags are pushed to the ECR repository:
-   ```bash
-   docker push $IMAGE_NAME:${{ github.sha }}
-   docker push $IMAGE_NAME:latest
-   ```
+### Authenticating to Amazon ECR
 
-Each pipeline run therefore publishes an immutable, commit-pinned image (`:<git-sha>`) alongside a moving `:latest` tag in the `juice-shop` ECR repository:
+The host must be able to pull from the private ECR repository. Export
+short-lived credentials for a least-privileged IAM principal that has
+`ecr:GetAuthorizationToken` and `ecr:BatchGetImage`/`ecr:GetDownloadUrlForLayer`
+on the `juice-shop` repository, then perform a Docker login:
 
-![AWS ECR — juice-shop repository images](screenshots/ecr-juice-shop-images.png)
+```bash
+export AWS_ACCESS_KEY_ID=<REDACTED>
+export AWS_SECRET_ACCESS_KEY=<REDACTED>
+export AWS_DEFAULT_REGION=us-east-2
 
+aws ecr get-login-password \
+  | docker login \
+      --username AWS \
+      --password-stdin 991776826356.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+```
+
+> :warning: **Do not commit the access keys.** For production use, prefer
+> an EC2 instance profile (IAM role attached to the instance) so the host
+> obtains short-lived credentials from the EC2 metadata service and no
+> static secrets ever land on disk. The pipeline itself uses the
+> `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` GitHub Actions secrets.
+
+### Verifying the Deployed Container
+
+Once the pipeline's `deploy_image` job has completed at least once, the
+host runs a container named `juice-shop` published on port 3000. From the
+EC2 host:
+
+```bash
+ubuntu@ip-172-31-40-185:~$ docker ps
+CONTAINER ID   IMAGE                                                            COMMAND                  STATUS         PORTS                                         NAMES
+66707acebacc   991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop:latest   "/nodejs/bin/node /j…"  Up About a minute   0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp   juice-shop
+```
+
+The application is then reachable from any browser at
+`http://<EC2_PUBLIC_IP>:3000/` and serves the standard Juice Shop product
+catalog:
+
+![Juice Shop catalog served from the EC2 application host on port 3000](screenshots/juice-shop-running.png)
+
+## Self-Hosted GitHub Actions Runner
+
+The `build_image` job targets `runs-on: [self-hosted, juice-shop]` because
+the Docker build for Juice Shop exceeds the disk and memory available on
+GitHub-hosted runners. A dedicated EC2 instance is registered as a
+self-hosted runner against the
+[`OkomaNdu/juice-shop-devsecops-pipelin`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin)
+repository to execute that job.
+
+### Provisioning the Runner EC2 Instance (`self-hosted-runner`)
+
+An Ubuntu 26.04 LTS EC2 instance named **`self-hosted-runner`** was
+created with a 20 GiB root volume in `us-east-2`. Only port `22` from
+the admin IP is required inbound — the runner reaches GitHub via
+outbound HTTPS, so no inbound HTTP rules are needed.
+
+```bash
+chmod 400 ~/Downloads/github-runner-key.pem
+ssh -i ~/Downloads/github-runner-key.pem ubuntu@<RUNNER_PUBLIC_IP>
+```
+
+### Registering the Runner with GitHub
+
+Generate a runner registration token from
+**Settings → Actions → Runners → New self-hosted runner** in the
+repository, then on the EC2 host:
+
+```bash
+mkdir actions-runner && cd actions-runner
+curl -o actions-runner-linux-x64-2.334.0.tar.gz -L \
+  https://github.com/actions/runner/releases/download/v2.334.0/actions-runner-linux-x64-2.334.0.tar.gz
+echo "048024cd2c848eb6f14d5646d56c13a4def2ae7ee3ad12122bee960c56f3d271  actions-runner-linux-x64-2.334.0.tar.gz" \
+  | shasum -a 256 -c
+tar xzf ./actions-runner-linux-x64-2.334.0.tar.gz
+
+./config.sh \
+  --url https://github.com/OkomaNdu/juice-shop-devsecops-pipelin \
+  --token <REGISTRATION_TOKEN>
+```
+
+During interactive setup, the following values were used so the
+`build_image` job's `runs-on` selector matches:
+
+| Prompt                  | Value                       |
+|-------------------------|-----------------------------|
+| Runner group            | `Default` (Enter)           |
+| Runner name             | `ubuntu-selfhost`           |
+| Additional labels       | `aws,ec2,juice-shop`        |
+| Work folder             | `_work` (Enter)             |
+
+> Registration tokens are short-lived (≈1 hour) and single-use. Do not
+> store the value used here — generate a fresh one whenever a runner
+> needs to be (re-)registered.
+
+### Installing Build Tooling on the Runner
+
+The runner needs Docker (to build and push the image) and the AWS CLI
+(to authenticate to ECR before pushing):
+
+```bash
+sudo apt update
+sudo apt install -y docker.io awscli
+sudo usermod -aG docker ubuntu
+```
+
+Log out and back in so that the `ubuntu` user picks up the `docker`
+group membership; otherwise the runner's `docker build` step will fail
+with `permission denied while trying to connect to the docker API`.
+
+### Running the Runner as a Service
+
+So the runner survives reboots and runs detached from the interactive
+shell, install it as a systemd service from inside the
+`actions-runner` directory:
+
+```bash
+sudo ./svc.sh install
+sudo ./svc.sh start
+sudo ./svc.sh status
+```
+
+Once the service is `active (running)`, the runner appears as **Idle**
+in the GitHub Actions UI and will pick up any job whose `runs-on`
+labels are a subset of `self-hosted, Linux, X64, aws, ec2, juice-shop`.
 
 ## Setup
 
