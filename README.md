@@ -51,6 +51,7 @@ For a detailed introduction, full list of features and architecture overview ple
   - [Registering the Runner with GitHub](#registering-the-runner-with-github)
   - [Installing Build Tooling on the Runner](#installing-build-tooling-on-the-runner)
   - [Running the Runner as a Service](#running-the-runner-as-a-service)
+  - [Runner Image Cache & Disk Hygiene](#runner-image-cache--disk-hygiene)
 - [Setup](#setup)
     - [From Sources](#from-sources)
     - [Packaged Distributions](#packaged-distributions)
@@ -246,6 +247,13 @@ Once the pipeline's `deploy_image` job has completed at least once, the
 host runs a container named `juice-shop` published on port 3000. From the
 EC2 host:
 
+> :warning: **Open port 3000 inbound on the application Security Group.**
+> The container publishes on `3000`, but the default Security Group only
+> allows SSH (22). Without an explicit inbound rule for TCP `3000` from
+> `0.0.0.0/0` (or a narrower CIDR), `docker ps` will show the container
+> as `Up` but the browser request will simply time out. This was the
+> first thing missed during initial verification.
+
 ```bash
 ubuntu@ip-172-31-40-185:~$ docker ps
 CONTAINER ID   IMAGE                                                            COMMAND                  STATUS         PORTS                                         NAMES
@@ -342,6 +350,67 @@ sudo ./svc.sh status
 Once the service is `active (running)`, the runner appears as **Idle**
 in the GitHub Actions UI and will pick up any job whose `runs-on`
 labels are a subset of `self-hosted, Linux, X64, aws, ec2, juice-shop`.
+
+### Runner Image Cache & Disk Hygiene
+
+Because `build_image` runs locally, the runner accumulates Docker
+layers across every pipeline execution. After a few runs the host
+holds the BuildKit builder image, the build-stage base image, the
+final distroless runtime base, and one tagged Juice Shop image per
+commit SHA plus `:latest`:
+
+```bash
+ubuntu@ip-172-31-15-38:~$ docker images
+IMAGE                                                                                            ID             DISK USAGE   CONTENT SIZE
+991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop:bccc03e3a2e96be594c28f2d16f78dbe0aeea1fa   4e923996bb72        969MB          198MB
+991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop:d3b03bad7358d5deef60f84ac81e27526aa0a6b9   838137cc8187        969MB          198MB
+991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop:latest                                    838137cc8187        969MB          198MB
+gcr.io/distroless/nodejs:18                                                                       b534f9b5528e        228MB         51.9MB
+moby/buildkit:buildx-stable-1                                                                     0168606be231        355MB          111MB
+node:18                                                                                           c6ae79e38498       1.58GB          411MB
+```
+
+This **caching is intentional and desirable** — keeping
+`moby/buildkit:buildx-stable-1`, `node:18` and
+`gcr.io/distroless/nodejs:18` warm on disk is exactly what produces
+the `10m 44s → 8s` `build_image` speedup visible between runs `#103`
+and `#104`. The cost is steady disk growth.
+
+#### Reclaiming space without invalidating the build cache
+
+The 20 GiB root volume on `self-hosted-runner` is comfortable for
+single-digit days of builds. When usage starts to creep up
+(`df -h /` past ~70%), prune *dangling* layers only — these are
+intermediate layers no longer referenced by any tag and are pure
+overhead. **Do not** run `docker system prune -a`; that would also
+evict the BuildKit/Node base images and force the next pipeline run
+back to a cold `10m+` build.
+
+```bash
+ubuntu@ip-172-31-15-38:~$ sudo docker image prune
+WARNING! This will remove all dangling images.
+Are you sure you want to continue? [y/N] y
+Deleted Images:
+untagged: sha256:0fa610c502c6...
+...
+Total reclaimed space: 1.467GB
+```
+
+After the prune the tagged images survive and the next `build_image`
+job still hits cache:
+
+```bash
+ubuntu@ip-172-31-15-38:~$ df -h /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root        24G  7.1G   17G  31% /
+```
+
+> :information_source: **Two-tag retention is by design.** The pipeline
+> tags every build with both `:${{ github.sha }}` and `:latest`. The
+> SHA tag gives us a forensic record on the runner of exactly which
+> commits were built locally, and is what would let us roll the
+> application host back to a specific commit by re-pulling that tag
+> directly from ECR.
 
 ## Setup
 
