@@ -176,28 +176,36 @@ jobs:
     name: Trivy Image Scan
     runs-on: ubuntu-latest
     continue-on-error: true
-    needs: build_image 
+    needs: build_image
     container:
-      image: docker:24
-      options: --privileged
+      image: aquasec/trivy:latest
+      options: --entrypoint ""
     steps:
-      - name: Install dependencies
-        run: |
-          apk --no-cache add curl python3 py3-pip
-          pip3 install --no-cache-dir awscli --break-system-packages
+      - name: Install AWS CLI
+        run: apk --no-cache add aws-cli
       - name: Set IMAGE_NAME
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - name: Log in to ECR
         run: |
           aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
-          docker login --username AWS --password-stdin \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com     
-      - name: Install Trivy
+          trivy registry login \
+            --username AWS \
+            --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - name: Run Trivy scan
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin
-      - name: Pull image from ECR
-        run: docker pull $IMAGE_NAME:${{ github.sha }}
+          trivy image \
+            -f json \
+            -o trivy.json \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            $IMAGE_NAME:${{ github.sha }}
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy.json
 
   deploy_image:
     runs-on: ubuntu-latest
