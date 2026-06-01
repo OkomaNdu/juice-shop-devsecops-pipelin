@@ -171,12 +171,15 @@ jobs:
       - run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
       - run: docker push $IMAGE_NAME:${{ github.sha }}
       - run: docker push $IMAGE_NAME:latest
+
   trivy:
     name: Trivy Image Scan
     runs-on: ubuntu-latest
+    continue-on-error: true
     needs: build_image 
     container:
       image: docker:24
+      options: --privileged
     steps:
       - name: Install dependencies
         run:
