@@ -182,7 +182,7 @@ jobs:
       options: --privileged
     steps:
       - name: Install dependencies
-        run:
+        run: |
           apk --no-cache add curl python3 py3-pip
           pip3 install --no-cache-dir awscli --break-system-packages
       - name: Set IMAGE_NAME
