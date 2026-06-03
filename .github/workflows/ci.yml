@@ -9,7 +9,7 @@ env:
   AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
   SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
   IMAGE_NAME: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
-  SERVER_IP: 18.220.251.253
+  SERVER_IP: 18.188.220.17
   SERVER_USER: ubuntu
 
 jobs:
