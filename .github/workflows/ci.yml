@@ -168,12 +168,8 @@ jobs:
           trivy image \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
-            $IMAGE_NAME:${{ github.sha }}
-          trivy image \
             -f json \
             -o trivy.json \
-            --severity HIGH,CRITICAL \
-            --exit-code 1 \
             $IMAGE_NAME:${{ github.sha }}
       - name: Upload Trivy report
         if: always()
