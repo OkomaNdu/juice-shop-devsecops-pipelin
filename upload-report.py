@@ -28,7 +28,7 @@ data = {
     'verified': True,
     'scan_type': scan_type,
     'minimum_severity': 'Low',
-    'engagement': 1
+    'engagement': 2
 }
 
 files = {
