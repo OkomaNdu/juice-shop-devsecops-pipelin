@@ -188,7 +188,7 @@ jobs:
     needs: [gitleaks, njsscan, semgrep, retire, trivy]
     container: python:3
     env:
-     DEFECTDOJO_API_KEY: ${{ vars.DEFECTDOJO_API_KEY }}
+     DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - name: Download gitleaks report
