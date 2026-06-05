@@ -25,79 +25,109 @@
 
 This repository delivers a fully automated DevSecOps pipeline for the
 [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/) application.
-Every push to GitHub triggers an 8-stage workflow that runs unit tests,
-executes five independent security gates (secrets, two SAST engines, and a
-software-composition scan), builds a Docker image on a self-hosted runner,
-publishes it to a private Amazon ECR registry, and performs a zero-touch
-SSH-based rolling deployment to a target EC2 instance.
+Every push to GitHub triggers a **10-stage workflow** that runs unit tests,
+executes **six integrated security gates** (secrets, two SAST engines,
+software-composition analysis, container image scanning, and AWS-native
+registry scanning), builds a hardened Docker image on a self-hosted runner,
+publishes it to a private Amazon ECR registry, automatically imports every
+scan report into a central **DefectDojo** vulnerability-management
+instance, and performs a zero-touch SSH-based rolling deployment to a
+target EC2 instance.
 
-The pipeline is engineered around three production-grade concerns:
+The pipeline is engineered around four production-grade concerns:
 
+- **Shift-left security** &mdash; six scanners cover the full
+  build-to-runtime spectrum: source (`gitleaks`, `njsscan`, `semgrep`),
+  dependencies (`retire.js`), container image (`Trivy`), and the
+  registry itself (Amazon ECR Enhanced Scanning powered by Inspector).
+  Every report is normalised into DefectDojo for centralised triage and
+  SLA tracking.
 - **Speed** &mdash; registry-based Docker layer caching, a shared `yarn`
-  cache, and a self-hosted runner cut end-to-end execution time from
-  **15&nbsp;m&nbsp;7&nbsp;s** to **4&nbsp;m&nbsp;44&nbsp;s** on re-runs
-  (≈&nbsp;70&nbsp;% reduction; the `build_image` stage alone drops from
-  10&nbsp;m&nbsp;44&nbsp;s → 8&nbsp;s).
-- **Security** &mdash; five scanners run in parallel; each uploads its raw
-  report as a workflow artifact and is configurable as either *blocking* or
-  *report-only*, ready to be forwarded into DefectDojo for centralised
-  triage.
+  cache, and a self-hosted runner cut the `build_image` stage from
+  **10&nbsp;m&nbsp;44&nbsp;s → 8&nbsp;s** between runs (≈&nbsp;99 % faster
+  re-builds when no source change invalidates the layer cache).
 - **Reproducibility** &mdash; every image is dual-tagged with its commit
-  SHA and `:latest`, giving an auditable, rollback-ready history in ECR.
+  SHA and `:latest`, giving an auditable, rollback-ready history in ECR
+  and on the self-hosted runner.
+- **Operability** &mdash; the runner runs under `systemd`; the
+  application host can be re-provisioned from the documented bootstrap
+  in minutes; secrets live exclusively in GitHub Actions and AWS, never
+  in the repository.
 
 ## Architecture
 
 ```text
-                 ┌──────────────┐       ┌─────────────────────────────────────────┐
-                 │  Developer   │       │           GitHub Actions (8 jobs)       │
-                 │   git push   │──────►│                                         │
-                 └──────────────┘       │  create_cache ──► yarn_test             │
-                                        │              │──► gitleaks  (secrets)   │
-                                        │              │──► njsscan   (SAST)      │
-                                        │              │──► semgrep   (SAST)      │
-                                        │              │──► retire    (SCA)       │
-                                        │              ▼                          │
-                                        │      ┌─────────────────────┐            │
-                                        │      │    build_image      │            │
-                                        │      │  (self-hosted EC2)  │            │
-                                        │      └─────────┬───────────┘            │
-                                        └────────────────┼────────────────────────┘
-                                                         │ docker push :sha + :latest
-                                                         ▼
-                                              ┌──────────────────────┐
-                                              │  Amazon ECR (priv.)  │
-                                              │ juice-shop repository│
-                                              └──────────┬───────────┘
-                                                         │ docker pull :latest (SSH)
-                                                         ▼
-                                              ┌──────────────────────┐
-                                              │   juice-app-server   │
-                                              │  Ubuntu 26.04 / EC2  │
-                                              │   :3000 → browser    │
-                                              └──────────────────────┘
+   ┌──────────────┐       ┌──────────────────────────────────────────────────────┐
+   │  Developer   │       │              GitHub Actions (10 jobs)                │
+   │   git push   │──────►│                                                      │
+   └──────────────┘       │  create_cache ──► yarn_test                          │
+                          │              │──► gitleaks   (secrets)               │
+                          │              │──► njsscan    (SAST → SARIF)          │
+                          │              │──► semgrep    (SAST)                  │
+                          │              │──► retire     (SCA)                   │
+                          │              ▼                                       │
+                          │      ┌─────────────────────┐                         │
+                          │      │    build_image      │                         │
+                          │      │  (self-hosted EC2)  │                         │
+                          │      └─────────┬───────────┘                         │
+                          │                │ docker push :sha + :latest          │
+                          │                ▼                                     │
+                          │      ┌─────────────────────┐    ┌─────────────────┐  │
+                          │      │ Amazon ECR (priv.)  │◄──►│ ECR Enhanced    │  │
+                          │      │ juice-shop repo     │    │ Scanning        │  │
+                          │      └─────────┬───────────┘    │ (AWS Inspector) │  │
+                          │                │                └─────────────────┘  │
+                          │                ▼                                     │
+                          │      ┌─────────────────────┐                         │
+                          │      │  trivy image scan   │ ── trivy.json ──┐       │
+                          │      └─────────┬───────────┘                 │       │
+                          │                ▼                             ▼       │
+                          │      ┌─────────────────────┐      ┌─────────────────┐│
+                          │      │   upload_reports    │─────►│   DefectDojo    ││
+                          │      │ (gitleaks/njsscan/  │      │   engagement    ││
+                          │      │  semgrep/retire/    │      │  (triage + SLA) ││
+                          │      │  trivy → DefectDojo)│      └─────────────────┘│
+                          │      └─────────┬───────────┘                         │
+                          │                ▼                                     │
+                          │      ┌─────────────────────┐                         │
+                          │      │    deploy_image     │                         │
+                          │      └─────────┬───────────┘                         │
+                          └────────────────┼────────────────────────────────────-┘
+                                           │ docker pull :latest (SSH)
+                                           ▼
+                                ┌──────────────────────┐
+                                │   juice-app-server   │
+                                │  Ubuntu 26.04 / EC2  │
+                                │   :3000 → browser    │
+                                └──────────────────────┘
 ```
 
 ## At a Glance
 
-| Capability                 | Implementation                                                                                            |
-|----------------------------|-----------------------------------------------------------------------------------------------------------|
-| **Pipeline orchestration** | GitHub Actions, 8 jobs, fan-out / fan-in DAG, dual `ubuntu-latest` + self-hosted runner topology          |
-| **Secrets scanning**       | `gitleaks` against full git history (`fetch-depth: 0`)                                                    |
-| **SAST**                   | `njsscan` (Node-specific, SARIF → GitHub Code Scanning) + `semgrep` (`p/javascript` ruleset)              |
-| **Dependency scanning**    | `retire.js` against `node_modules`                                                                        |
-| **Test execution**         | `yarn test` (Juice Shop unit suite) gated before image build                                              |
-| **Image registry**         | Private Amazon ECR repository, dual-tagged `:${{ github.sha }}` + `:latest`                               |
-| **Caching strategy**       | (1) `actions/cache` for `node_modules` / `.yarn` keyed on `yarn.lock`, (2) registry-based Docker BuildKit |
-| **Deployment**             | SSH-driven `docker pull` → `docker rm` → `docker run` on a `t2.micro` Ubuntu EC2 host                     |
-| **Infrastructure**         | 2 × Ubuntu 26.04 EC2 instances (app + self-hosted runner), least-privilege Security Groups                |
-| **Secrets management**     | GitHub Actions repository secrets for AWS keys + SSH private key; no plaintext credentials in the repo    |
+| Capability                  | Implementation                                                                                                          |
+|-----------------------------|-------------------------------------------------------------------------------------------------------------------------|
+| **Pipeline orchestration**  | GitHub Actions, 10 jobs, fan-out / fan-in DAG, dual `ubuntu-latest` + self-hosted runner topology                       |
+| **Secrets scanning**        | `gitleaks` against full git history (`fetch-depth: 0`)                                                                  |
+| **SAST**                    | `njsscan` (Node-specific, SARIF → GitHub Code Scanning) + `semgrep` (`p/javascript` ruleset)                            |
+| **Dependency scanning**     | `retire.js` against `node_modules`                                                                                      |
+| **Container image scanning**| `Trivy` against the freshly pushed ECR image, gated on HIGH / CRITICAL severities                                       |
+| **Registry-side scanning**  | Amazon ECR **Enhanced Scanning** (Amazon Inspector) &mdash; continuous, OS-package + language-package CVE coverage      |
+| **Vulnerability management**| All scan reports auto-imported into a central **DefectDojo** engagement via `upload-report.py` for triage and SLA tracking |
+| **Vulnerability remediation**| Hands-on CVE fix: upgraded `express-jwt` `0.1.3 → 6.0.0` to break the vulnerable transitive `jsonwebtoken` chain (CVE-2015-9235) |
+| **Image hardening**         | Multi-stage Dockerfile, non-root user (`USER 65532`), slim runtime base (`node:18-bookworm-slim`), final image ≈ 214 MB |
+| **Test execution**          | `yarn test` (Juice Shop unit suite) gated before image build                                                            |
+| **Image registry**          | Private Amazon ECR repository, dual-tagged `:${{ github.sha }}` + `:latest`                                             |
+| **Caching strategy**        | (1) `actions/cache` for `node_modules` / `.yarn` keyed on `yarn.lock`, (2) registry-based Docker BuildKit               |
+| **Deployment**              | SSH-driven `docker pull` → `docker rm` → `docker run` on a `t2.micro` Ubuntu EC2 host                                   |
+| **Infrastructure**          | 2 × Ubuntu 26.04 EC2 instances (app + self-hosted runner), least-privilege Security Groups                              |
+| **Secrets management**      | GitHub Actions repository secrets for AWS keys, DefectDojo API key, and SSH private key; no plaintext credentials in the repo |
 
 ## Live Deployment
 
 Once the pipeline succeeds, the application is served from a containerised
 distroless Node.js image on a dedicated EC2 instance:
 
-> :globe_with_meridians: **`http://3.17.39.163:3000/`**
+> :globe_with_meridians: **`http://18.118.27.38:3000/`**
 
 ![Juice Shop catalog served from the EC2 application host on port 3000](screenshots/juice-shop-running.png)
 
@@ -120,6 +150,12 @@ distroless Node.js image on a dedicated EC2 instance:
 - [CI Pipeline](#ci-pipeline)
   - [Pipeline Jobs](#pipeline-jobs)
   - [Building and Pushing the Image to AWS ECR](#building-and-pushing-the-image-to-aws-ecr)
+- [Image Security & Vulnerability Management](#image-security--vulnerability-management)
+  - [Trivy &mdash; CI-side Container Image Scanning](#trivy--ci-side-container-image-scanning)
+  - [Amazon ECR Enhanced Scanning (Inspector)](#amazon-ecr-enhanced-scanning-inspector)
+  - [Centralised Triage in DefectDojo](#centralised-triage-in-defectdojo)
+  - [Case Study &mdash; Remediating CVE-2015-9235 (`jsonwebtoken`)](#case-study--remediating-cve-2015-9235-jsonwebtoken)
+  - [Base Image Hardening &mdash; `distroless` → `node:18-bookworm-slim`](#base-image-hardening--distroless--node18-bookworm-slim)
 - [Release Deployment](#release-deployment)
   - [Provisioning the Application EC2 Instance (`juice-app-server`)](#provisioning-the-application-ec2-instance-juice-app-server)
   - [Installing Docker and the AWS CLI](#installing-docker-and-the-aws-cli)
@@ -151,7 +187,7 @@ sequential build-and-release fan-in:
 ```text
                  ┌─► yarn_test ─┐
                  ├─► gitleaks ──┤
- create_cache ──►┼─► njsscan ───┼──► build_image ──► deploy_image
+ create_cache ──►┼─► njsscan ───┼──► build_image ──► trivy ──► upload_reports ──► deploy_image
                  ├─► semgrep ───┤
                  └─► retire ────┘
 ```
@@ -169,7 +205,9 @@ Each job runs in its own container (or on the self-hosted runner for
 | `njsscan`       | `ubuntu-latest`                          | Node.js-specific SAST via `ajinabraham/njsscan-action`; uploads SARIF to GitHub code scanning and as an artifact.    | Blocks `build_image` on warnings                     |
 | `semgrep`       | `ubuntu-latest` (`semgrep/semgrep`)      | Generic SAST using the `p/javascript` ruleset; uploads `semgrep.json`.                                               | `continue-on-error: true`                            |
 | `retire`        | `ubuntu-latest` (`node:18-bullseye`)     | `retire.js` scan for known-vulnerable JavaScript dependencies; uploads `retire.json`.                                | `continue-on-error: true`                            |
-| `build_image`   | `self-hosted, juice-shop`                | Builds the Docker image and pushes both `:${{ github.sha }}` and `:latest` to ECR.                                   | Blocks `deploy_image`                                |
+| `build_image`   | `self-hosted, juice-shop`                | Builds the Docker image and pushes both `:${{ github.sha }}` and `:latest` to ECR.                                   | Blocks `trivy` & `deploy_image`                      |
+| `trivy`         | `ubuntu-latest` (`aquasec/trivy`)        | Pulls the freshly pushed image from ECR and scans for HIGH / CRITICAL CVEs; uploads `trivy.json` artifact.           | `continue-on-error: true` &mdash; reported, non-blocking |
+| `upload_reports`| `ubuntu-latest` (`python:3`)             | Downloads every scanner artifact and imports it into DefectDojo via `upload-report.py`.                              | Blocks `deploy_image`                                |
 | `deploy_image`  | `ubuntu-latest` (`debian:bullseye-slim`) | SSHes into the application EC2 host, pulls the new `:latest` tag and recreates the `juice-shop` container.           | Final stage                                          |
 
 The recent successful runs
@@ -229,6 +267,252 @@ moving pointer the `deploy_image` stage consumes.
 
 The deployment stage and the bootstrap of the application host are
 documented in [Release Deployment](#release-deployment) below.
+
+---
+
+## Image Security & Vulnerability Management
+
+Source-code scanning catches issues *before* the build; this section
+covers what catches issues *after* the build &mdash; in the container
+image, the registry, and across the long tail of transitive
+dependencies. The pipeline integrates three independent layers of image
+security and routes every finding into a single triage view in
+DefectDojo.
+
+| Layer            | Scanner                       | Where it runs                  | What it catches                                          |
+|------------------|-------------------------------|--------------------------------|----------------------------------------------------------|
+| CI image scan    | **Trivy**                     | GitHub Actions, post-`build_image` | OS package CVEs + language package CVEs in the freshly pushed image |
+| Registry scan    | **Amazon ECR Enhanced Scanning** (Inspector) | Continuous, AWS-managed | Same coverage as Trivy, but re-runs automatically whenever the CVE database changes &mdash; without re-running the pipeline |
+| Triage / SLA     | **DefectDojo**                | Hosted demo instance           | De-duplication, severity-based SLA tracking, risk-acceptance workflow, single pane of glass for all five scanners |
+
+![CI run #134 — full pipeline including Trivy image scan and DefectDojo upload-reports](screenshots/pipeline-with-trivy.png)
+
+> :information_source: The screenshot above shows pipeline run **#134**
+> &mdash; the post-Trivy / post-DefectDojo topology. End-to-end duration
+> is now 20&nbsp;m&nbsp;32&nbsp;s with the additional scan and upload
+> stages; the deploy-image hot path itself remains a few seconds
+> because of the registry-based build cache.
+
+### Trivy &mdash; CI-side Container Image Scanning
+
+The `trivy` job runs immediately after `build_image` so that the
+*exact bytes* that were just pushed to ECR are scanned, not a local
+rebuild:
+
+```yaml
+trivy:
+  name: Trivy Image Scan
+  runs-on: ubuntu-latest
+  continue-on-error: true
+  needs: build_image
+  container:
+    image: aquasec/trivy:latest
+    options: --entrypoint ""
+  steps:
+    - run: apk --no-cache add aws-cli
+    - name: Log in to ECR
+      run: |
+        aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+        trivy registry login \
+          --username AWS --password-stdin \
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+    - name: Run Trivy scan
+      run: |
+        trivy image \
+          --severity HIGH,CRITICAL \
+          --exit-code 1 \
+          -f json -o trivy.json \
+          $IMAGE_NAME:${{ github.sha }}
+    - name: Upload Trivy report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy.json
+        path: trivy.json
+```
+
+Design notes:
+
+- **Scan the SHA-tagged image, not `:latest`.** The SHA tag is
+  immutable; `:latest` could move between push and scan in a high-
+  throughput repo.
+- **Trivy authenticates to ECR through its native `trivy registry
+  login`** &mdash; no need to docker-pull the image first, which would
+  burn runner disk and bandwidth.
+- **`--exit-code 1` flips the job red** on any HIGH/CRITICAL finding,
+  while `continue-on-error: true` keeps the pipeline moving so the
+  finding still flows into DefectDojo for human triage. This is the
+  *report-now-fail-later* posture appropriate for a long-lived
+  vulnerable application; it would be inverted to *fail-fast* on a
+  production codebase.
+
+### Amazon ECR Enhanced Scanning (Inspector)
+
+Trivy gives a **point-in-time** snapshot at build time. To catch
+CVEs that are disclosed *after* an image is pushed, the
+`juice-shop` ECR repository has **Enhanced Scanning** turned on,
+which delegates the scan to Amazon Inspector. Inspector then keeps
+re-evaluating every image in the repo against its evolving CVE
+database with no pipeline involvement.
+
+A typical Inspector result page for a juice-shop image looks like
+this:
+
+![Amazon Inspector Enhanced Scanning results for the juice-shop ECR image — 36 Critical, 85 High, 56 Medium, 5 Low, 0 Info](screenshots/ecr-inspector-scan-results.png)
+
+The combination is deliberate:
+
+- **Trivy** is a *gate* &mdash; it fires on every build and feeds the
+  developer feedback loop.
+- **ECR Enhanced Scanning** is a *watchtower* &mdash; it monitors
+  in-registry images continuously, so a CVE disclosed at 03:00 UTC
+  shows up on the next on-call dashboard refresh even if nobody has
+  pushed code in weeks.
+
+### Centralised Triage in DefectDojo
+
+Five scanners producing five different JSON / SARIF formats is
+unmanageable without aggregation. The `upload_reports` job downloads
+every scan artifact and POSTs it to a DefectDojo engagement via a
+small helper script,
+[`upload-report.py`](upload-report.py):
+
+```python
+# upload-report.py (excerpt)
+if   file_name == 'gitleaks.json':  scan_type = 'Gitleaks Scan'
+elif file_name == 'njsscan.sarif':  scan_type = 'SARIF'
+elif file_name == 'semgrep.json':   scan_type = 'Semgrep JSON Report'
+elif file_name == 'retire.json':    scan_type = 'Retire.js Scan'
+elif file_name == 'trivy.json':     scan_type = 'Trivy Scan'
+
+url = 'https://demo.defectdojo.org/api/v2/import-scan/'
+data = {
+    'active': True,
+    'verified': True,
+    'scan_type': scan_type,
+    'minimum_severity': 'Low',
+    'engagement': 2,
+}
+files = {'file': open(file_name, 'rb')}
+response = requests.post(url, headers=headers, data=data, files=files)
+```
+
+The `DEFECTDOJO_API_KEY` is supplied as a GitHub Actions secret;
+no credentials live in the script or the repository.
+
+After a successful pipeline, a single DefectDojo engagement holds
+the full per-scanner test list with normalised severity, CWE
+mapping, and de-duplication:
+
+![DefectDojo engagement for release version 1.1.1 — 5 imported tests (Gitleaks, Retire.js, Semgrep, Trivy, nodejsscan SARIF), 168 active findings](screenshots/defectdojo-all-scans.png)
+
+Drilling into the Trivy test exposes every container CVE with CWE
+references, EPSS scores, fixed-in versions, and a per-finding SLA
+clock:
+
+![DefectDojo Trivy Scan findings — 114 container CVEs with severity, CWE, and Vulnerability ID columns](screenshots/defectdojo-trivy-findings.png)
+
+This is what closes the DevSecOps loop: a developer no longer has
+to read five raw JSON files to know what changed in their risk
+posture between commits &mdash; they read one engagement.
+
+### Case Study &mdash; Remediating CVE-2015-9235 (`jsonwebtoken`)
+
+Once the pipeline started feeding DefectDojo, the `Retire.js Scan`
+test flagged a critical finding inside the project's dependency
+tree:
+
+> **CVE-2015-9235** &mdash; `jsonwebtoken` < 4.2.2 allows JWT
+> signature verification to be bypassed by tampering with the
+> `alg` header. Severity: **Critical**.
+
+The challenge in a Juice Shop context is that the top-level
+`jsonwebtoken@0.4.0` dependency is *intentionally* vulnerable
+&mdash; one of the CTF challenges relies on it. The actual problem
+was that it was *also* being pulled in transitively through
+`express-jwt@0.1.3`, which has no training value and was simply
+out of date.
+
+**Step 1 &mdash; identify the dependency chain:**
+
+```bash
+$ npm ls jsonwebtoken
+juice-shop@17.3.0 /home/ndu/DevSecOps/juice-shop
+├── express-jwt@0.1.3
+│ └── jsonwebtoken@0.1.0       ← transitive, unwanted
+└── jsonwebtoken@0.4.0          ← top-level, intentional CTF
+```
+
+**Step 2 &mdash; cut the transitive chain by upgrading the parent
+package** in `package.json`:
+
+```diff
+- "express-jwt": "0.1.3",
++ "express-jwt": "6.0.0",
+```
+
+**Step 3 &mdash; reinstall and re-verify:**
+
+```bash
+npm install
+npm ls jsonwebtoken          # express-jwt no longer pulls a JWT lib
+```
+
+**Step 4 &mdash; let the pipeline re-import** so the finding
+auto-mitigates in DefectDojo on the next push.
+
+This is the kind of fix that demonstrates *triage maturity*: the
+engineer keeps the genuinely-load-bearing vulnerability (the
+top-level `jsonwebtoken@0.4.0` that the training material depends
+on) while killing the duplicate, non-load-bearing one introduced by
+an outdated middleware version.
+
+### Base Image Hardening &mdash; `distroless` → `node:18-bookworm-slim`
+
+The original Dockerfile ran the final stage on
+`gcr.io/distroless/nodejs:18`. Distroless is a sensible default
+&mdash; it strips a shell and most of userspace &mdash; but in
+practice the `nodejs:18` distroless image bundles a fixed Node
+runtime version that is not always the smallest viable layer, and
+its lack of a shell makes operational tasks (entry-point
+debugging, `kubectl exec` style troubleshooting) more expensive.
+
+The final stage now uses **`node:18-bookworm-slim`**:
+
+```dockerfile
+FROM node:18 AS installer
+COPY . /juice-shop
+WORKDIR /juice-shop
+RUN npm i -g typescript ts-node
+RUN npm install --omit=dev --unsafe-perm
+RUN npm dedupe
+# … prune build artefacts, set ownership …
+
+FROM node:18-bookworm-slim
+WORKDIR /juice-shop
+COPY --from=installer --chown=65532:0 /juice-shop .
+USER 65532
+EXPOSE 3000
+CMD ["/juice-shop/build/app.js"]
+```
+
+Engineering trade-offs:
+
+- **Image size** &mdash; the final pushed image is **214 MB** in ECR
+  (visible in the Inspector screenshot above), comfortably smaller
+  than the distroless variant it replaced.
+- **Hardening preserved** &mdash; the container still runs as a
+  non-root UID (`USER 65532`), copies only the production deps, and
+  ships no build toolchain.
+- **Operability gained** &mdash; `bookworm-slim` keeps a minimal
+  Debian userspace, so on-call can `docker exec -it juice-shop sh`
+  during an incident without rebuilding the image.
+
+The accepted cost is a slightly larger CVE surface than distroless
+(more userspace packages → more potential CVEs), which is exactly
+why the **Trivy + ECR Enhanced Scanning combo** is non-negotiable:
+the scanners make the cost of the friendlier base image
+*observable* and *bounded*.
 
 ---
 
