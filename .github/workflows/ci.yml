@@ -3,8 +3,6 @@ name: CI
 on: [push]
 
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
   IMAGE_NAME: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
@@ -24,16 +22,10 @@ jobs:
       - run: docker push $IMAGE_NAME:latest
 
   deploy_image:
-    runs-on: ubuntu-latest
-    container: 
-      image: amazon/aws-cli
-      options: --entrypoint ""
+    runs-on: [self-hosted, juice-shop]
     steps:
     - run: |
-        IMAGE_NAME="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop"
-        LOG_IN_CMD="export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID; \
-        export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY; \
-        export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION; aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com  "
+        LOG_IN_CMD="export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION; aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com  "
         COMMAND_TO_EXECUTE="docker pull $IMAGE_NAME:latest && \
         (docker stop juice-shop 2>/dev/null || true) && \
         (docker rm juice-shop 2>/dev/null || true)  && \
