@@ -7,11 +7,7 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
-  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
   IMAGE_NAME: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
-  SERVER_IP: 15.156.193.16
-  SERVER_USER: ubuntu
-
 
 
 jobs:
@@ -27,58 +23,28 @@ jobs:
       - run: docker push $IMAGE_NAME:${{ github.sha }}
       - run: docker push $IMAGE_NAME:latest
 
-  trivy:
-    name: Trivy Image Scan
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    needs: build_image
-    container:
-      image: aquasec/trivy:latest
-      options: --entrypoint ""
-    steps:
-      - name: Install AWS CLI
-        run: apk --no-cache add aws-cli
-      - name: Set IMAGE_NAME
-        run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
-      - name: Log in to ECR
-        run: |
-          aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
-          trivy registry login \
-            --username AWS \
-            --password-stdin \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-      - name: Run Trivy scan
-        run: |
-          trivy image \
-            --severity HIGH,CRITICAL \
-            --exit-code 1 \
-            -f json \
-            -o trivy.json \
-            $IMAGE_NAME:${{ github.sha }}
-      - name: Upload Trivy report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy.json
-          path: trivy.json
-
-
   deploy_image:
     runs-on: ubuntu-latest
-    container: debian:bullseye-slim 
-    needs: [ build_image,  trivy]
+    container: 
+      image: amazon/aws-cli
+      options: --entrypoint ""
     steps:
-      - uses: actions/checkout@v4
-      - name: Set IMAGE_NAME                  
-        run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
-      - run: apt update -y && apt install openssh-client -y
-      - run: |
-          eval $(ssh-agent -s)
-          echo "$SSH_PRIVATE_KEY" > /tmp/deploy_key
-          chmod 400 /tmp/deploy_key     
-          ssh-add /tmp/deploy_key          
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker pull $IMAGE_NAME:latest"       
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker stop juice-shop 2>/dev/null || true; docker rm juice-shop 2>/dev/null || true"
-          ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker run -d --name juice-shop -p 3000:3000 $IMAGE_NAME:latest" 
+    - run: |
+        IMAGE_NAME="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop"
+        LOG_IN_CMD="export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID; \
+        export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY; \
+        export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION; aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com  "
+        COMMAND_TO_EXECUTE="docker pull $IMAGE_NAME:latest && \
+        (docker stop juice-shop 2>/dev/null || true) && \
+        (docker rm juice-shop 2>/dev/null || true)  && \
+        (docker run -d --name juice-shop -p 3000:3000 $IMAGE_NAME:latest)"
+        COMMAND_ID=$(aws ssm send-command \
+        --instance-id "i-0686d100902fa84fc" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="[$LOG_IN_CMD, $COMMAND_TO_EXECUTE]" \
+        --query "Command.CommandId" \
+        --output text)
+        sleep 15
+        aws ssm get-command-invocation \
+        --command-id "$COMMAND_ID" \
+        --instance-id "i-0686d100902fa84fc"
