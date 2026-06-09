@@ -28,7 +28,7 @@ jobs:
         COMMAND_ID=$(aws ssm send-command \
         --instance-id "i-0686d100902fa84fc" \
         --document-name "AWS-RunShellScript" \
-        --parameters commands=[$LOG_IN_CMD, $COMMAND_TO_EXECUTE] \
+        --parameters commands="[$LOG_IN_CMD, $COMMAND_TO_EXECUTE]" \
         --query "Command.CommandId" \
         --output text)
         aws ssm get-command-invocation \
