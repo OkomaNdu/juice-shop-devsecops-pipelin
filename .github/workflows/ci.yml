@@ -17,5 +17,9 @@ jobs:
       image: amazon/aws-cli
       options: --entrypoint ""
     steps:
-      - run: aws ssm send-command --instance-id "i-0686d100902fa84fc" --document-name "AWS-RunShellScript" --parameters 'commands=["echo HelloWorld"]
+    - run: |
+        aws ssm send-command \
+        --instance-id "i-0686d100902fa84fc" \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="echo HelloWorld"
            
