@@ -25,6 +25,7 @@ jobs:
     runs-on: [self-hosted, juice-shop]
     steps:
     - run: |
+        IMAGE_NAME="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop"   
         LOG_IN_CMD="export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION; aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com  "
         COMMAND_TO_EXECUTE="docker pull $IMAGE_NAME:latest && \
         (docker stop juice-shop 2>/dev/null || true) && \
