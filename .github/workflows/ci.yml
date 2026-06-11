@@ -14,32 +14,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set IMAGE_NAME
-        run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
+        run: echo "IMAGE_NAME=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - name: Log in to ECR
-        run: aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-      - run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
-      - run: docker push $IMAGE_NAME:${{ github.sha }}
-      - run: docker push $IMAGE_NAME:latest
+        run: |
+          aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+          | docker login --username AWS --password-stdin \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - name: Build image
+        run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
+      - name: Push image
+        run: |
+          docker push $IMAGE_NAME:${{ github.sha }}
+          docker push $IMAGE_NAME:latest
 
   deploy_image:
     runs-on: [self-hosted, juice-shop]
     needs: build_image
     steps:
-    - uses: actions/checkout@v4  
-    - name: Deploy via SSM
-      run: |
-        LOG_IN_CMD="export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION; aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com  "
-        COMMAND_TO_EXECUTE="docker pull $IMAGE_NAME:latest && \
-        (docker stop juice-shop 2>/dev/null || true) && \
-        (docker rm juice-shop 2>/dev/null || true)  && \
-        (docker run -d --name juice-shop -p 3000:3000 $IMAGE_NAME:latest)"
-        COMMAND_ID=$(aws ssm send-command \
-        --instance-id "i-02bdbe4a63e46aff8" \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands="[$LOG_IN_CMD, $COMMAND_TO_EXECUTE]" \
-        --query "Command.CommandId" \
-        --output text)
-        sleep 15
-        aws ssm get-command-invocation \
-        --command-id "$COMMAND_ID" \
-        --instance-id "i-02bdbe4a63e46aff8"
+      - name: Deploy via SSM
+        run: |
+          IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/juice-shop"
+          LOG_IN_CMD="export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}; aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+          COMMAND_TO_EXECUTE="docker pull ${IMAGE_NAME}:latest && \
+          (docker stop juice-shop 2>/dev/null || true) && \
+          (docker rm juice-shop 2>/dev/null || true) && \
+          (docker run -d --name juice-shop -p 3000:3000 ${IMAGE_NAME}:latest)"
+          PARAMS=$(jq -n \
+            --arg cmd1 "$LOG_IN_CMD" \
+            --arg cmd2 "$COMMAND_TO_EXECUTE" \
+            '{commands: [$cmd1, $cmd2]}')
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-id "i-02bdbe4a63e46aff8" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" \
+            --output text)
+          sleep 15
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "i-02bdbe4a63e46aff8"
+          --instance-id "i-02bdbe4a63e46aff8"
