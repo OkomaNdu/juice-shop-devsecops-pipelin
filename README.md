@@ -25,14 +25,14 @@
 
 This repository delivers a fully automated DevSecOps pipeline for the
 [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/) application.
-Every push to GitHub triggers a **10-stage workflow** that runs unit tests,
+Every push to GitHub triggers a **9-stage workflow** that runs unit tests,
 executes **six integrated security gates** (secrets, two SAST engines,
 software-composition analysis, container image scanning, and AWS-native
 registry scanning), builds a hardened Docker image on a self-hosted runner,
-publishes it to a private Amazon ECR registry, automatically imports every
-scan report into a central **DefectDojo** vulnerability-management
-instance, and performs a zero-touch SSH-based rolling deployment to a
-target EC2 instance.
+publishes it to a private Amazon ECR registry, and performs a zero-touch
+**keyless deployment to a target EC2 instance via AWS Systems Manager**
+&mdash; with the application host's SSH port permanently closed to the
+public internet.
 
 The pipeline is engineered around four production-grade concerns:
 
@@ -40,8 +40,19 @@ The pipeline is engineered around four production-grade concerns:
   build-to-runtime spectrum: source (`gitleaks`, `njsscan`, `semgrep`),
   dependencies (`retire.js`), container image (`Trivy`), and the
   registry itself (Amazon ECR Enhanced Scanning powered by Inspector).
-  Every report is normalised into DefectDojo for centralised triage and
-  SLA tracking.
+  Scan reports are also wired for one-shot import into a central
+  **DefectDojo** engagement via [`upload-report.py`](upload-report.py)
+  for human triage and SLA tracking.
+- **Zero-trust operations, zero static credentials** &mdash; the
+  production EC2 host runs with **port 22 closed**. Deployments and
+  break-glass shell access both go through **AWS Systems Manager
+  Session Manager**, authenticated by IAM role instead of static SSH
+  keys. *Both* the application host and the self-hosted runner carry
+  EC2 instance profiles (`app-server-role` and `github-runner-role`),
+  so the pipeline itself holds **no `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, or `.pem` file** in either GitHub Actions
+  secrets or the workflow `env:`. All AWS auth is delegated to the
+  EC2 metadata service.
 - **Speed** &mdash; registry-based Docker layer caching, a shared `yarn`
   cache, and a self-hosted runner cut the `build_image` stage from
   **10&nbsp;m&nbsp;44&nbsp;s → 8&nbsp;s** between runs (≈&nbsp;99 % faster
@@ -49,16 +60,12 @@ The pipeline is engineered around four production-grade concerns:
 - **Reproducibility** &mdash; every image is dual-tagged with its commit
   SHA and `:latest`, giving an auditable, rollback-ready history in ECR
   and on the self-hosted runner.
-- **Operability** &mdash; the runner runs under `systemd`; the
-  application host can be re-provisioned from the documented bootstrap
-  in minutes; secrets live exclusively in GitHub Actions and AWS, never
-  in the repository.
 
 ## Architecture
 
 ```text
    ┌──────────────┐       ┌──────────────────────────────────────────────────────┐
-   │  Developer   │       │              GitHub Actions (10 jobs)                │
+   │  Developer   │       │               GitHub Actions (9 jobs)                │
    │   git push   │──────►│                                                      │
    └──────────────┘       │  create_cache ──► yarn_test                          │
                           │              │──► gitleaks   (secrets)               │
@@ -66,61 +73,69 @@ The pipeline is engineered around four production-grade concerns:
                           │              │──► semgrep    (SAST)                  │
                           │              │──► retire     (SCA)                   │
                           │              ▼                                       │
-                          │      ┌─────────────────────┐                         │
-                          │      │    build_image      │                         │
-                          │      │  (self-hosted EC2)  │                         │
-                          │      └─────────┬───────────┘                         │
-                          │                │ docker push :sha + :latest          │
-                          │                ▼                                     │
-                          │      ┌─────────────────────┐    ┌─────────────────┐  │
-                          │      │ Amazon ECR (priv.)  │◄──►│ ECR Enhanced    │  │
-                          │      │ juice-shop repo     │    │ Scanning        │  │
-                          │      └─────────┬───────────┘    │ (AWS Inspector) │  │
-                          │                │                └─────────────────┘  │
-                          │                ▼                                     │
-                          │      ┌─────────────────────┐                         │
-                          │      │  trivy image scan   │ ── trivy.json ──┐       │
-                          │      └─────────┬───────────┘                 │       │
-                          │                ▼                             ▼       │
-                          │      ┌─────────────────────┐      ┌─────────────────┐│
-                          │      │   upload_reports    │─────►│   DefectDojo    ││
-                          │      │ (gitleaks/njsscan/  │      │   engagement    ││
-                          │      │  semgrep/retire/    │      │  (triage + SLA) ││
-                          │      │  trivy → DefectDojo)│      └─────────────────┘│
-                          │      └─────────┬───────────┘                         │
-                          │                ▼                                     │
-                          │      ┌─────────────────────┐                         │
-                          │      │    deploy_image     │                         │
-                          │      └─────────┬───────────┘                         │
-                          └────────────────┼────────────────────────────────────-┘
-                                           │ docker pull :latest (SSH)
-                                           ▼
-                                ┌──────────────────────┐
-                                │   juice-app-server   │
-                                │  Ubuntu 26.04 / EC2  │
-                                │   :3000 → browser    │
-                                └──────────────────────┘
+                          │      ┌────────────────────────────────────────────┐  │
+                          │      │  build_image  +  deploy_image              │  │
+                          │      │  ─────────────────────────────────         │  │
+                          │      │  runs-on: [self-hosted, juice-shop]        │  │
+                          │      │                                            │  │
+                          │      │       ┌────────────────────────────┐       │  │
+                          │      │       │  self-hosted-runner (EC2)  │       │  │
+                          │      │       │  IAM role: github-runner-  │       │  │
+                          │      │       │           role             │       │  │
+                          │      │       │    ├─ AmazonEC2Container-  │       │  │
+                          │      │       │    │  RegistryFullAccess   │       │  │
+                          │      │       │    └─ AmazonSSMFullAccess  │       │  │
+                          │      │       └─────┬──────────────┬───────┘       │  │
+                          │      └─────────────┼──────────────┼───────────────┘  │
+                          │                    │              │                  │
+                          │       docker push  │              │  aws ssm         │
+                          │       :sha+:latest │              │  send-command    │
+                          │                    ▼              │                  │
+                          │      ┌─────────────────────┐      │ ┌──────────────┐ │
+                          │      │ Amazon ECR (priv.)  │◄────►│ │ ECR Enhanced │ │
+                          │      │ juice-shop repo     │      │ │ Scanning     │ │
+                          │      └─────────┬───────────┘      │ │ (Inspector)  │ │
+                          │                │                  │ └──────────────┘ │
+                          │                ▼                  │                  │
+                          │      ┌─────────────────────┐      │                  │
+                          │      │  trivy image scan   │      │                  │
+                          │      └─────────────────────┘      │                  │
+                          └─────────────────────────────────-─┼──────────────────┘
+                                                              ▼
+                                ┌──────────────────────────────────────┐
+                                │           juice-app-server           │
+                                │     Ubuntu 26.04 / EC2 t2.micro      │
+                                │  IAM role: app-server-role           │
+                                │    ├─ AmazonSSMManagedInstanceCore   │
+                                │    └─ AmazonEC2ContainerRegistryFull │
+                                │                                      │
+                                │  amazon-ssm-agent  ──►  docker pull  │
+                                │                         docker run   │
+                                │                            :3000 ───►│ browser
+                                └──────────────────────────────────────┘
 ```
 
 ## At a Glance
 
 | Capability                  | Implementation                                                                                                          |
 |-----------------------------|-------------------------------------------------------------------------------------------------------------------------|
-| **Pipeline orchestration**  | GitHub Actions, 10 jobs, fan-out / fan-in DAG, dual `ubuntu-latest` + self-hosted runner topology                       |
+| **Pipeline orchestration**  | GitHub Actions, 9 jobs, fan-out / fan-in DAG, dual `ubuntu-latest` + self-hosted runner topology                        |
 | **Secrets scanning**        | `gitleaks` against full git history (`fetch-depth: 0`)                                                                  |
 | **SAST**                    | `njsscan` (Node-specific, SARIF → GitHub Code Scanning) + `semgrep` (`p/javascript` ruleset)                            |
 | **Dependency scanning**     | `retire.js` against `node_modules`                                                                                      |
 | **Container image scanning**| `Trivy` against the freshly pushed ECR image, gated on HIGH / CRITICAL severities                                       |
 | **Registry-side scanning**  | Amazon ECR **Enhanced Scanning** (Amazon Inspector) &mdash; continuous, OS-package + language-package CVE coverage      |
-| **Vulnerability management**| All scan reports auto-imported into a central **DefectDojo** engagement via `upload-report.py` for triage and SLA tracking |
+| **Vulnerability management**| Scan reports normalised for **DefectDojo** import via [`upload-report.py`](upload-report.py) (Gitleaks / SARIF / Semgrep / Retire.js / Trivy) for triage and SLA tracking |
 | **Vulnerability remediation**| Hands-on CVE fix: upgraded `express-jwt` `0.1.3 → 6.0.0` to break the vulnerable transitive `jsonwebtoken` chain (CVE-2015-9235) |
 | **Image hardening**         | Multi-stage Dockerfile, non-root user (`USER 65532`), slim runtime base (`node:18-bookworm-slim`), final image ≈ 214 MB |
 | **Test execution**          | `yarn test` (Juice Shop unit suite) gated before image build                                                            |
 | **Image registry**          | Private Amazon ECR repository, dual-tagged `:${{ github.sha }}` + `:latest`                                             |
 | **Caching strategy**        | (1) `actions/cache` for `node_modules` / `.yarn` keyed on `yarn.lock`, (2) registry-based Docker BuildKit               |
-| **Deployment**              | SSH-driven `docker pull` → `docker rm` → `docker run` on a `t2.micro` Ubuntu EC2 host                                   |
-| **Infrastructure**          | 2 × Ubuntu 26.04 EC2 instances (app + self-hosted runner), least-privilege Security Groups                              |
-| **Secrets management**      | GitHub Actions repository secrets for AWS keys, DefectDojo API key, and SSH private key; no plaintext credentials in the repo |
+| **Deployment transport**    | **AWS Systems Manager Session Manager** (`aws ssm send-command`) &mdash; no SSH, no port 22, no static keys             |
+| **App-host identity**       | EC2 instance profile `app-server-role` &mdash; `AmazonSSMManagedInstanceCore` + `AmazonEC2ContainerRegistryFullAccess`  |
+| **CI-runner identity**      | EC2 instance profile `github-runner-role` &mdash; `AmazonEC2ContainerRegistryFullAccess` + `AmazonSSMFullAccess`        |
+| **Infrastructure**          | 2 × Ubuntu 26.04 EC2 instances (app + self-hosted runner), least-privilege Security Groups (app host has **no inbound 22**) |
+| **Secrets management**      | The pipeline holds **no static AWS credentials** &mdash; both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are removed from GitHub Actions secrets; only the DefectDojo API key remains |
 
 ## Live Deployment
 
@@ -156,6 +171,15 @@ distroless Node.js image on a dedicated EC2 instance:
   - [Centralised Triage in DefectDojo](#centralised-triage-in-defectdojo)
   - [Case Study &mdash; Remediating CVE-2015-9235 (`jsonwebtoken`)](#case-study--remediating-cve-2015-9235-jsonwebtoken)
   - [Base Image Hardening &mdash; `distroless` → `node:18-bookworm-slim`](#base-image-hardening--distroless--node18-bookworm-slim)
+- [Secure Continuous Deployment via AWS Systems Manager](#secure-continuous-deployment-via-aws-systems-manager)
+  - [Why SSM Instead of SSH](#why-ssm-instead-of-ssh)
+  - [Verifying the SSM Agent](#verifying-the-ssm-agent)
+  - [Two Instance Profiles, Zero Static Credentials in CI](#two-instance-profiles-zero-static-credentials-in-ci)
+  - [The `app-server-role` IAM Role (App-Host Side)](#the-app-server-role-iam-role-app-host-side)
+  - [The `github-runner-role` IAM Role (CI-Runner Side)](#the-github-runner-role-iam-role-ci-runner-side)
+  - [Attaching the Roles to the EC2 Instances](#attaching-the-roles-to-the-ec2-instances)
+  - [Connecting to the Host via Session Manager](#connecting-to-the-host-via-session-manager)
+  - [The `deploy_image` Job &mdash; `aws ssm send-command`](#the-deploy_image-job--aws-ssm-send-command)
 - [Release Deployment](#release-deployment)
   - [Provisioning the Application EC2 Instance (`juice-app-server`)](#provisioning-the-application-ec2-instance-juice-app-server)
   - [Installing Docker and the AWS CLI](#installing-docker-and-the-aws-cli)
@@ -185,11 +209,11 @@ security gates after a shared dependency-cache stage, followed by a
 sequential build-and-release fan-in:
 
 ```text
-                 ┌─► yarn_test ─┐
-                 ├─► gitleaks ──┤
- create_cache ──►┼─► njsscan ───┼──► build_image ──► trivy ──► upload_reports ──► deploy_image
-                 ├─► semgrep ───┤
-                 └─► retire ────┘
+                 ┌─► yarn_test ─┐                       ┌─► trivy           (post-build scan)
+                 ├─► gitleaks ──┤                       │
+ create_cache ──►┼─► njsscan ───┼──► build_image ──────►┤
+                 ├─► semgrep ───┤                       │
+                 └─► retire ────┘                       └─► deploy_image    (via AWS SSM)
 ```
 
 ### Pipeline Jobs
@@ -207,8 +231,7 @@ Each job runs in its own container (or on the self-hosted runner for
 | `retire`        | `ubuntu-latest` (`node:18-bullseye`)     | `retire.js` scan for known-vulnerable JavaScript dependencies; uploads `retire.json`.                                | `continue-on-error: true`                            |
 | `build_image`   | `self-hosted, juice-shop`                | Builds the Docker image and pushes both `:${{ github.sha }}` and `:latest` to ECR.                                   | Blocks `trivy` & `deploy_image`                      |
 | `trivy`         | `ubuntu-latest` (`aquasec/trivy`)        | Pulls the freshly pushed image from ECR and scans for HIGH / CRITICAL CVEs; uploads `trivy.json` artifact.           | `continue-on-error: true` &mdash; reported, non-blocking |
-| `upload_reports`| `ubuntu-latest` (`python:3`)             | Downloads every scanner artifact and imports it into DefectDojo via `upload-report.py`.                              | Blocks `deploy_image`                                |
-| `deploy_image`  | `ubuntu-latest` (`debian:bullseye-slim`) | SSHes into the application EC2 host, pulls the new `:latest` tag and recreates the `juice-shop` container.           | Final stage                                          |
+| `deploy_image`  | `self-hosted, juice-shop`                | Issues `aws ssm send-command` against the app-server instance ID to pull the new image and recreate the container &mdash; **no SSH**. | Final stage                                          |
 
 The recent successful runs
 ([`#103`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/26548881468),
@@ -239,11 +262,13 @@ The cache key rolls automatically whenever `yarn.lock` changes, and the
 #### Scan Reports as Artifacts
 
 Every security gate uploads its raw report as a workflow artifact
-(`gitleaks-report`, `njsscan.sarif`, `semgrep.json`, `retire.json`).
-The commented-out `upload_reports` job in `ci.yml` is the hook for
-forwarding those artifacts into DefectDojo for centralised triage
-&mdash; enable it once the `DEFECTDOJO_API_KEY` repository variable
-is set.
+(`gitleaks-report`, `njsscan.sarif`, `semgrep.json`, `retire.json`,
+`trivy.json`). The companion script
+[`upload-report.py`](upload-report.py) normalises each format and
+imports it into DefectDojo through its REST API; it can be wired
+into the workflow as a follow-up job whenever the
+`DEFECTDOJO_API_KEY` secret is provisioned, or invoked manually
+against the downloaded artifacts.
 
 ### Building and Pushing the Image to AWS ECR
 
@@ -372,10 +397,12 @@ The combination is deliberate:
 ### Centralised Triage in DefectDojo
 
 Five scanners producing five different JSON / SARIF formats is
-unmanageable without aggregation. The `upload_reports` job downloads
-every scan artifact and POSTs it to a DefectDojo engagement via a
-small helper script,
-[`upload-report.py`](upload-report.py):
+unmanageable without aggregation. The companion helper
+[`upload-report.py`](upload-report.py) normalises every report and
+POSTs it into a single DefectDojo engagement via the platform's
+REST API. It can be invoked as a follow-up workflow job, run from
+a maintainer's workstation against the downloaded artifacts, or
+scheduled out-of-band on a cadence:
 
 ```python
 # upload-report.py (excerpt)
@@ -516,14 +543,266 @@ the scanners make the cost of the friendlier base image
 
 ---
 
+## Secure Continuous Deployment via AWS Systems Manager
+
+The deploy stage no longer ships code over SSH. The application
+host (`juice-app-server`) runs with **inbound port 22 permanently
+closed**; both production deployments *and* break-glass shell
+access happen through **AWS Systems Manager Session Manager**,
+authenticated by IAM role rather than by `.pem` files.
+
+### Why SSM Instead of SSH
+
+| Concern                              | SSH-based deploy (old)                                  | SSM-based deploy (current)                                       |
+|--------------------------------------|---------------------------------------------------------|------------------------------------------------------------------|
+| **Inbound attack surface**           | TCP 22 open to `0.0.0.0/0` (or jump-host CIDR)          | **No inbound ports** required for management; only `:3000` for app traffic |
+| **Authentication material**          | Long-lived `app-server-key.pem` shipped to every engineer + stored as a GitHub Actions secret | Short-lived IAM credentials issued by AWS STS to the EC2 instance profile |
+| **Key rotation / revocation**        | Manual: rotate `.pem`, redistribute, update GitHub secret, redeploy | Revoke or detach the IAM role in the console &mdash; effective immediately, no key handling |
+| **Audit trail**                      | `sshd` logs on the host (lost if the host is rebuilt)   | CloudTrail records every `ssm:SendCommand` and Session Manager session, centrally and tamper-evident |
+| **Compromised laptop blast radius**  | Attacker gains shell on the host until the key is rotated | Attacker would also need the engineer's federated AWS identity + an explicit `StartSession` permission |
+
+The change reduced the host's externally reachable management
+surface from "one open SSH port plus a private key in CI" to
+**zero**.
+
+### Verifying the SSM Agent
+
+The Amazon-provided Ubuntu AMI ships the `amazon-ssm-agent` snap
+pre-installed. Open the browser-based EC2 Instance Connect shell
+(or, in early bring-up, an SSH session that will later be retired)
+and confirm the service is `active (running)`:
+
+```bash
+sudo systemctl status snap.amazon-ssm-agent.amazon-ssm-agent.service
+```
+
+```text
+● snap.amazon-ssm-agent.amazon-ssm-agent.service - Service for snap application amazon-ssm-agent.amazon-ssm-agent
+     Loaded: loaded (/etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service; enabled; preset: enabled)
+     Active: active (running) since …
+       Docs: man:snap.amazon-ssm-agent.amazon-ssm-agent
+   Main PID: 1247 (amazon-ssm-agen)
+      Tasks: 12 (limit: 1130)
+     Memory: 56.2M (peak: 60.1M)
+        CPU: 3.214s
+     CGroup: /system.slice/snap.amazon-ssm-agent.amazon-ssm-agent.service
+             └─1247 /snap/amazon-ssm-agent/…/amazon-ssm-agent
+```
+
+If the service is `inactive` or `failed`, install/restart it before
+proceeding &mdash; SSM cannot manage a host whose agent is not
+phoning home.
+
+### Two Instance Profiles, Zero Static Credentials in CI
+
+The pipeline needs to do four AWS-authenticated operations:
+
+| Operation                              | Where it runs                | Done by                |
+|----------------------------------------|------------------------------|------------------------|
+| `docker push` to ECR                   | `build_image` on the runner  | `github-runner-role`   |
+| `aws ssm send-command`                 | `deploy_image` on the runner | `github-runner-role`   |
+| `docker pull` from ECR                 | the app host (via SSM)       | `app-server-role`      |
+| Receive Session Manager / RunShellScript | the app host (SSM agent)    | `app-server-role`      |
+
+Rather than ship `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` to
+either the GitHub Actions secret store or the host filesystem,
+**each EC2 instance carries its own instance profile** and AWS
+authentication is delegated to the EC2 metadata service entirely:
+
+> **How the credential plumbing works.** When software on an EC2
+> instance issues an AWS API request, the AWS SDK / CLI
+> automatically reaches the instance metadata service
+> (`169.254.169.254`), retrieves the role's temporary credentials
+> (Access Key ID, Secret Access Key, and session token, all
+> rotated every few hours by AWS), and signs the request with
+> them. The application code &mdash; whether that's `docker
+> login` calling `aws ecr get-login-password` inside
+> `build_image`, or `aws ssm send-command` inside `deploy_image`
+> &mdash; never has to read a credential file or an environment
+> variable. The role *is* the credential.
+
+The practical effect on the workflow file is striking: the only
+AWS-related entries left in the workflow `env:` block are
+**non-secret** repository variables for the account ID and
+region:
+
+```yaml
+env:
+  AWS_ACCOUNT_ID:    ${{ vars.AWS_ACCOUNT_ID }}     # repo variable, not a secret
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }} # repo variable, not a secret
+```
+
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` have been
+**deleted from GitHub Actions secrets** entirely.
+
+### The `app-server-role` IAM Role (App-Host Side)
+
+The application host carries an instance profile, **`app-server-role`**,
+with two AWS-managed policies attached:
+
+| Managed policy                          | Why it is required                                                                                            |
+|-----------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| `AmazonSSMManagedInstanceCore`          | Lets the SSM agent register the instance and receive `SendCommand` / Session Manager invocations from the runner. |
+| `AmazonEC2ContainerRegistryFullAccess`  | Lets the host authenticate to ECR with no static keys &mdash; `aws ecr get-login-password` works straight from the metadata service. |
+
+> :information_source: `AmazonEC2ContainerRegistryFullAccess` is a
+> broad policy. In a production tightening pass it would be
+> replaced with a custom policy restricted to
+> `ecr:GetAuthorizationToken` + the pull-only verbs
+> (`ecr:BatchCheckLayerAvailability`, `ecr:GetDownloadUrlForLayer`,
+> `ecr:BatchGetImage`) scoped to the `juice-shop` repository ARN.
+
+### The `github-runner-role` IAM Role (CI-Runner Side)
+
+The self-hosted runner carries its own instance profile,
+**`github-runner-role`**, that lets every workflow job dispatched
+to it borrow AWS permissions transparently:
+
+| Managed policy                          | Why it is required                                                                                            |
+|-----------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| `AmazonEC2ContainerRegistryFullAccess`  | Lets `build_image` push the freshly built Docker image to ECR with no static keys.                            |
+| `AmazonSSMFullAccess`                   | Lets `deploy_image` issue `aws ssm send-command` and `aws ssm get-command-invocation` against the app-host instance ID. |
+
+Because the runner is registered with GitHub Actions as a
+self-hosted runner under a system user that inherits the EC2
+instance's permissions, **every action that runs on this runner
+&mdash; whether authored by us or pulled from the marketplace
+&mdash; transitively gets these AWS permissions for free**. There
+is nothing to copy into job environments, nothing to rotate, and
+no secret value that could be exfiltrated by a malicious action
+because the credential never materialises as a string anywhere
+the action can read.
+
+> :information_source: `AmazonSSMFullAccess` is similarly broad
+> and would be replaced in a production tightening pass with a
+> custom policy granting only `ssm:SendCommand` (constrained to
+> the `AWS-RunShellScript` document and the `juice-app-server`
+> instance ID via `Condition` keys) and
+> `ssm:GetCommandInvocation`.
+
+### Attaching the Roles to the EC2 Instances
+
+Both roles are attached through the same console flow, once per
+instance:
+
+1. **EC2 → Instances** → select `juice-app-server` *(or
+   `self-hosted-runner`)*.
+2. **Actions** → **Security** → **Modify IAM role**.
+3. Choose the matching role from the dropdown
+   (`app-server-role` or `github-runner-role`) and
+   **Update IAM role**.
+
+The change takes effect within seconds &mdash; no instance
+restart, no agent restart. After attaching `app-server-role`,
+the next `aws ssm describe-instance-information` call from the
+runner will list the application host as managed and reachable:
+
+![SSM Session Manager browser shell on juice-app-server — amazon-ssm-agent active (running), with the pre-role EC2RoleProvider errors visible in the journal](screenshots/ssm-agent-status.png)
+
+> :information_source: The `EC2RoleProvider Failed to connect to
+> Systems Manager` lines in the journal above are the SSM agent
+> retrying *before* the role was attached. After the attach,
+> those errors stop and the instance shows up under
+> **Systems Manager → Fleet Manager** as a managed node. This is
+> a useful piece of operational forensics: if SSM ever stops
+> working, the agent journal will tell you whether the instance
+> lost its role.
+
+### Connecting to the Host via Session Manager
+
+For interactive break-glass access (post-incident triage, ad-hoc
+log inspection):
+
+1. **EC2 → Instances** → select `juice-app-server`.
+2. Click **Connect**.
+3. Pick the **Session Manager** tab.
+4. Click **Connect**.
+
+A browser-based shell opens as the `ssm-user` user. Every
+keystroke and command is captured in CloudTrail and (optionally)
+streamed to S3 or CloudWatch Logs &mdash; an audit posture SSH
+cannot match without bolt-on tooling.
+
+With this in place, the `app-server-key.pem` workstation key and
+the `SSH_PRIVATE_KEY` GitHub Actions secret are both retired.
+
+### The `deploy_image` Job &mdash; `aws ssm send-command`
+
+The CI side of the new deploy path lives in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+```yaml
+deploy_image:
+  runs-on: [self-hosted, juice-shop]
+  needs: build_image
+  steps:
+    - name: Deploy via SSM
+      run: |
+        LOG_IN_CMD="export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}; \
+                    aws ecr get-login-password \
+                    | docker login --username AWS --password-stdin \
+                       ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+
+        COMMAND_TO_EXECUTE="docker pull ${IMAGE_NAME}:latest \
+                            && (docker stop juice-shop || true) \
+                            && (docker rm   juice-shop || true) \
+                            && docker run -d --name juice-shop \
+                                 -p 3000:3000 ${IMAGE_NAME}:latest"
+
+        COMMAND_ID=$(aws ssm send-command \
+                       --instance-ids "i-0a81ff2840891c8f7" \
+                       --document-name "AWS-RunShellScript" \
+                       --parameters "commands=[$LOG_IN_CMD, $COMMAND_TO_EXECUTE]" \
+                       --query "Command.CommandId" --output text)
+
+        sleep 15
+        aws ssm get-command-invocation \
+          --command-id "$COMMAND_ID" \
+          --instance-id "i-0a81ff2840891c8f7"
+```
+
+Engineering notes:
+
+- **`runs-on: [self-hosted, juice-shop]`** &mdash; the runner
+  carries the `github-runner-role` instance profile, so
+  `aws ssm send-command` and `aws ecr get-login-password` both
+  authenticate transparently through the EC2 metadata service.
+  The job needs no `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+  in `env:` &mdash; and those secrets have been deleted from the
+  repository's Actions secret store entirely.
+- **The instance ID is the target**, not the IP &mdash; this
+  removes a long-standing fragility where re-launching the EC2
+  host changed its public IP and silently broke the SSH-based
+  deploy until the workflow file was patched (visible in the git
+  history: four consecutive `updated instance id` commits).
+- **`AWS-RunShellScript`** is the AWS-managed SSM Document; no
+  custom document needs to be authored or versioned.
+- The `sleep 15` + `aws ssm get-command-invocation` pair gives
+  the runner the command's stdout/stderr and an exit code in the
+  GitHub Actions log so failed deploys are visible without
+  hopping into the SSM console.
+
+The end-to-end result is visible in pipeline run
+[`#171`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/27516360696)
+("deployment using ssm to ec2 instance and github-runner"):
+`build_image` and `deploy_image` both run on the runner, both
+land green, neither references an AWS key:
+
+![CI run #171 — build_image (12m 40s) and deploy_image (19s) both run on the IAM-roled self-hosted runner with zero AWS secrets in env](screenshots/pipeline-ssm-deploy.png)
+
+---
+
 ## Release Deployment
 
 The release stage of the pipeline (`build_image` → `deploy_image` in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the Juice
 Shop Docker image on a self-hosted runner, pushes it to Amazon ECR
-(`991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop`), and SSHs
-into a dedicated EC2 application server to pull the new `:latest` tag
-and recreate the running container.
+(`991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop`), and uses
+**AWS Systems Manager** to instruct the application EC2 instance to
+pull the new `:latest` tag and recreate the running container &mdash;
+without ever opening an SSH connection (see
+[Secure Continuous Deployment via AWS Systems Manager](#secure-continuous-deployment-via-aws-systems-manager)
+for the transport-level details).
 
 This section documents the one-time bootstrap performed on the target
 EC2 host so that the pipeline's `deploy_image` job has everything it
@@ -532,24 +811,27 @@ needs to land a release.
 ### Provisioning the Application EC2 Instance (`juice-app-server`)
 
 A `t2.micro` Ubuntu 26.04 LTS EC2 instance named **`juice-app-server`**
-was created in `us-east-2`. The Security Group exposes:
+was created in `us-east-2`. The Security Group exposes a single port:
 
-| Port | Source      | Purpose                         |
-|------|-------------|---------------------------------|
-| 22   | Admin IP    | SSH bootstrap & pipeline deploy |
-| 3000 | `0.0.0.0/0` | Juice Shop HTTP                 |
+| Port | Source      | Purpose                                                                   |
+|------|-------------|---------------------------------------------------------------------------|
+| 3000 | `0.0.0.0/0` | Juice Shop HTTP traffic                                                   |
+| ~~22~~ | &mdash;   | **Intentionally closed.** Management traffic goes through SSM Session Manager &mdash; no inbound SSH. |
 
-Connect to the instance from the workstation using the downloaded key
-pair:
+Initial connection during early bring-up was via the AWS Console's
+**EC2 Instance Connect** browser shell; once the
+`app-server-role` IAM role is attached (see
+[Secure Continuous Deployment via AWS Systems Manager](#secure-continuous-deployment-via-aws-systems-manager)),
+all subsequent operator access flows through Session Manager and the
+instance is targeted by its **instance ID**, not a public IP:
 
-```bash
-chmod 400 ~/Downloads/app-server-key.pem
-ssh -i ~/Downloads/app-server-key.pem ubuntu@<EC2_PUBLIC_IP>
+```text
+juice-app-server  →  i-0a81ff2840891c8f7   (us-east-2)
 ```
 
-> The same public IP must be set as `SERVER_IP` in
-> [`.github/workflows/ci.yml`](.github/workflows/ci.yml) so that the
-> `deploy_image` job can reach it.
+> Because the deploy job addresses the host by instance ID rather
+> than IP, re-launches and IP changes do **not** require updating
+> the workflow file.
 
 ### Installing Docker and the AWS CLI
 
@@ -571,15 +853,13 @@ a fresh `ssh` login resolves it.
 
 ### Authenticating to Amazon ECR
 
-The host must be able to pull from the private ECR repository. Export
-short-lived credentials for a least-privileged IAM principal that has
-`ecr:GetAuthorizationToken` and
-`ecr:BatchGetImage` / `ecr:GetDownloadUrlForLayer` on the `juice-shop`
-repository, then perform a Docker login:
+ECR authentication on the host is **fully keyless**. Because the
+`app-server-role` instance profile carries the
+`AmazonEC2ContainerRegistryFullAccess` policy, the AWS CLI on the
+host obtains short-lived credentials directly from the EC2
+metadata service and Docker login Just Works:
 
 ```bash
-export AWS_ACCESS_KEY_ID=<REDACTED>
-export AWS_SECRET_ACCESS_KEY=<REDACTED>
 export AWS_DEFAULT_REGION=us-east-2
 
 aws ecr get-login-password \
@@ -588,23 +868,27 @@ aws ecr get-login-password \
       --password-stdin 991776826356.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 ```
 
-> :warning: **Do not commit access keys.** For production use, prefer an
-> EC2 instance profile (IAM role attached to the instance) so the host
-> obtains short-lived credentials from the EC2 metadata service and no
-> static secrets ever land on disk. The pipeline itself uses the
-> `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` GitHub Actions secrets.
+The same call is executed remotely by the `deploy_image` job via
+SSM &mdash; no `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` is
+exported on the host, written to disk, or stored in the pipeline
+for this purpose. The IAM role *is* the credential.
+
+> :information_source: **Earlier iterations of this README** showed
+> static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` exports on
+> the host as the ECR login mechanism. That model has been retired
+> in favour of the instance profile above; any keys produced under
+> the previous flow should be rotated and removed.
 
 ### Verifying the Deployed Container
 
 Once the pipeline's `deploy_image` job has completed at least once, the
 host runs a container named `juice-shop` published on port 3000.
 
-> :warning: **Open port 3000 inbound on the application Security Group.**
-> The container publishes on `3000`, but the default Security Group only
-> allows SSH (22). Without an explicit inbound rule for TCP `3000` from
-> `0.0.0.0/0` (or a narrower CIDR), `docker ps` will show the container
-> as `Up` but browser requests will simply time out. This was the first
-> issue caught during initial verification.
+> :warning: **The Security Group must allow TCP 3000 inbound from
+> `0.0.0.0/0`** (or a narrower CIDR). Until that rule exists,
+> `docker ps` will show the container as `Up` but browser requests
+> simply time out &mdash; one of the first issues caught during
+> initial verification.
 
 ```bash
 ubuntu@ip-172-31-40-185:~$ docker ps
