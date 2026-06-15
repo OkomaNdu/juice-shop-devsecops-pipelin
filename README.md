@@ -964,9 +964,24 @@ The runner needs Docker (to build and push the image) and the AWS CLI
 (to authenticate to ECR before pushing):
 
 ```bash
-sudo apt update
-sudo apt install -y docker.io awscli
-sudo usermod -aG docker ubuntu
+# 1. Update system
+sudo apt-get update -y
+
+# 2. Install dependencies
+sudo apt-get install -y unzip jq curl
+
+# 3. Install Docker
+sudo apt-get install -y docker.io
+sudo systemctl enable docker
+sudo systemctl start docker
+sudo usermod -aG docker $USER
+
+# 4. Install AWS CLI — pinned to 2.17.0 to avoid Python 3.14 argparse bug
+curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.17.0.zip" -o awscliv2.zip
+unzip -q awscliv2.zip
+sudo ./aws/install
+rm -rf awscliv2.zip aws/
+aws --version  # should show 2.17.0 Python/3.11.8
 ```
 
 Log out and back in so that the `ubuntu` user picks up the `docker`
