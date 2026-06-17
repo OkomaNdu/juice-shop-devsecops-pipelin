@@ -40,7 +40,7 @@ jobs:
           --instance-id "i-04fde04c814d2959d"
 
   zap_baseline:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, juice-shop]
     needs: deploy_test
     container:
       image: ghcr.io/zaproxy/zaproxy:stable
@@ -59,6 +59,16 @@ jobs:
         with:
           name: zap-baseline
           path: baseline.xml
+  
+  deploy_prod:
+    runs-on: [self-hosted, juice-shop]
+    needs: [zap_baseline]
+    environment: production
+    steps:
+      - name: Deploy to production
+        run: echo "deploying to production environment"
+
+
 
 
 
