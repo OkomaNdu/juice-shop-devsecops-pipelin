@@ -15,6 +15,8 @@ elif file_name == 'retire.json':
     scan_type = 'Retire.js Scan'
 elif file_name == 'trivy.json':
     scan_type = 'Trivy Scan'
+elif file_name == 'baseline.xml':
+    scan_type = 'ZAP Scan'
 
 
 headers = {
@@ -28,7 +30,7 @@ data = {
     'verified': True,
     'scan_type': scan_type,
     'minimum_severity': 'Low',
-    'engagement': 2
+    'engagement': 16
 }
 
 files = {
