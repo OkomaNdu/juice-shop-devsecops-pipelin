@@ -139,24 +139,14 @@ jobs:
 
   trivy:
     name: Trivy Image Scan
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, juice-shop]
     continue-on-error: true
     needs: build_image
-    container:
-      image: aquasec/trivy:latest
-      options: --entrypoint ""
     steps:
-      - name: Install AWS CLI
-        run: apk --no-cache add aws-cli
       - name: Set IMAGE_NAME
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - name: Log in to ECR
-        run: |
-          aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
-          trivy registry login \
-            --username AWS \
-            --password-stdin \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+        run: aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - name: Run Trivy scan
         run: |
           trivy image \
