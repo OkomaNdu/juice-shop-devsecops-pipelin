@@ -143,6 +143,8 @@ jobs:
     continue-on-error: true
     needs: build_image
     steps:
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
       - name: Set IMAGE_NAME
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - name: Log in to ECR
@@ -160,7 +162,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: trivy.json
-          path: trivy.json    
+          path: trivy.json 
 
   deploy_test:
     runs-on: [self-hosted, juice-shop]
