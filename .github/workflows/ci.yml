@@ -190,20 +190,21 @@ jobs:
     container:
       image: ghcr.io/zaproxy/zaproxy:stable
     env:
-      ZAP_TARGET: "http://3.99.244.152:3000"
+      ZAP_TARGET: "http://35.183.7.43:3000"
     steps:
+      - uses: actions/checkout@v4
       - name: Prepare ZAP workspace
         run: mkdir -p /zap/wrk
       - name: Run ZAP Baseline Scan
         run: |
           zap-baseline.py -t "$ZAP_TARGET" -g gen.conf -I -x baseline.xml
-          cp /zap/wrk/baseline.xml baseline.xml
+          cp /zap/wrk/baseline.xml $GITHUB_WORKSPACE/baseline.xml
       - name: Upload Baseline Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zap-baseline
-          path: baseline.xml
+          path: ${{ github.workspace }}/baseline.xml
 
   upload_reports:
     name: upload-reports
