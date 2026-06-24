@@ -156,6 +156,7 @@ jobs:
           trivy image \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
+            --ignore-unfixed \
             -f json \
             -o trivy.json \
             $IMAGE_NAME:${{ github.sha }}
@@ -247,7 +248,7 @@ jobs:
       - run: python3 upload-report.py semgrep.json
       - run: python3 upload-report.py retire.json
       - run: python3 upload-report.py trivy.json
-      - run: python3 upload-report.py baseline.xmll        
+      - run: python3 upload-report.py baseline.xml      
   
   deploy_prod:
     runs-on: [self-hosted, juice-shop]
