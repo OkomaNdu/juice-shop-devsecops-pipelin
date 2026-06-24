@@ -233,21 +233,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
          name: retire.json
-      - name: Download trivy.json 
+      - name: Download trivy.json
         uses: actions/download-artifact@v4
         with:
-         name: trivy.json  
-      - name: Download baseline.xml
+         name: trivy.json
+      - name: Download zap-baseline
         uses: actions/download-artifact@v4
         with:
-         name: baseline.xml     
+         name: zap-baseline
       - run: pip install requests
       - run: python3 upload-report.py gitleaks.json
       - run: python3 upload-report.py njsscan.sarif
       - run: python3 upload-report.py semgrep.json
-      - run: python3 upload-report.py retire.json 
-      - run: python3 upload-report.py trivy.json 
-      - run: python3 upload-report.py baseline.xml        
+      - run: python3 upload-report.py retire.json
+      - run: python3 upload-report.py trivy.json
+      - run: python3 upload-report.py baseline.xmll        
   
   deploy_prod:
     runs-on: [self-hosted, juice-shop]
