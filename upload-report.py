@@ -43,4 +43,6 @@ if response.status_code ==201:
     print('scan results imported successfully')
 else:
     print(f'failed to import scan results: {response.content}') 
+
+    
    
