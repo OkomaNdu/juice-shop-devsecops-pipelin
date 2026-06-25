@@ -17,6 +17,8 @@ elif file_name == 'trivy.json':
     scan_type = 'Trivy Scan'
 elif file_name == 'baseline.xml':
     scan_type = 'ZAP Scan'
+elif file_name == 'zap.xml':
+    scan_type = 'ZAP Scan    
 
 
 headers = {
@@ -44,5 +46,5 @@ if response.status_code ==201:
 else:
     print(f'failed to import scan results: {response.content}') 
 
-    
+
    
