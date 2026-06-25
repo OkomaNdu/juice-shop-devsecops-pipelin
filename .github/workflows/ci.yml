@@ -207,10 +207,32 @@ jobs:
           name: zap-baseline
           path: ${{ github.workspace }}/baseline.xml
 
+  zap_full:
+    runs-on: [self-hosted, juice-shop]
+    needs: deploy_test
+    container:
+      image: ghcr.io/zaproxy/zaproxy:stable
+    env:
+      ZAP_TARGET: "http://35.183.101.126:3000"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare ZAP workspace
+        run: mkdir -p /zap/wrk
+      - name: Run ZAP full Scan
+        run: |
+          zap-full-scan.py -t "$ZAP_TARGET" -g gen.conf -I -x zap.xml
+          cp /zap/wrk/zap.xml $GITHUB_WORKSPACE/zap.xml
+      - name: Upload full scan Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-full
+          path: ${{ github.workspace }}/zap.xml        
+
   upload_reports:
     name: upload-reports
     runs-on: ubuntu-latest
-    needs: [gitleaks, njsscan, semgrep, retire, trivy, zap_baseline]
+    needs: [gitleaks, njsscan, semgrep, retire, trivy, zap_baseline, zap_full]
     if: always()
     container: python:3
     env:
@@ -242,13 +264,18 @@ jobs:
         uses: actions/download-artifact@v4
         with:
          name: zap-baseline
+      - name: Download zap-full
+        uses: actions/download-artifact@v4
+        with:
+         name: zap-full
       - run: pip install requests
       - run: python3 upload-report.py gitleaks.json
       - run: python3 upload-report.py njsscan.sarif
       - run: python3 upload-report.py semgrep.json
       - run: python3 upload-report.py retire.json
       - run: python3 upload-report.py trivy.json
-      - run: python3 upload-report.py baseline.xml      
+      - run: python3 upload-report.py baseline.xml 
+      - run: python3 upload-report.py zap.xml     
   
   deploy_prod:
     runs-on: [self-hosted, juice-shop]
