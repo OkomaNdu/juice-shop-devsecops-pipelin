@@ -18,7 +18,7 @@ elif file_name == 'trivy.json':
 elif file_name == 'baseline.xml':
     scan_type = 'ZAP Scan'
 elif file_name == 'zap.xml':
-    scan_type = 'ZAP Scan    
+    scan_type = 'ZAP Scan'  
 
 
 headers = {
