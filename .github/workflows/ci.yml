@@ -191,7 +191,7 @@ jobs:
     container:
       image: ghcr.io/zaproxy/zaproxy:stable
     env:
-      ZAP_TARGET: "http://35.183.7.43:3000"
+      ZAP_TARGET: "http://35.183.101.126:3000"
     steps:
       - uses: actions/checkout@v4
       - name: Prepare ZAP workspace
