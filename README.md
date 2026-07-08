@@ -16,6 +16,8 @@
   <img alt="njsscan"         src="https://img.shields.io/badge/njsscan-SAST%20%28Node.js%29-blueviolet">
   <img alt="semgrep"         src="https://img.shields.io/badge/semgrep-SAST-1B66CD?logo=semgrep&logoColor=white">
   <img alt="retire.js"       src="https://img.shields.io/badge/retire.js-SCA-orange">
+  <img alt="Trivy"           src="https://img.shields.io/badge/Trivy-Image%20Scanning-1904DA?logo=aquasec&logoColor=white">
+  <img alt="OWASP ZAP"       src="https://img.shields.io/badge/OWASP%20ZAP-DAST-00549E?logo=owasp&logoColor=white">
   <img alt="DefectDojo"      src="https://img.shields.io/badge/DefectDojo-Vulnerability%20Mgmt-d62728">
 </p>
 
@@ -25,24 +27,27 @@
 
 This repository delivers a fully automated DevSecOps pipeline for the
 [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/) application.
-Every push to GitHub triggers a **9-stage workflow** that runs unit tests,
-executes **six integrated security gates** (secrets, two SAST engines,
-software-composition analysis, container image scanning, and AWS-native
-registry scanning), builds a hardened Docker image on a self-hosted runner,
-publishes it to a private Amazon ECR registry, and performs a zero-touch
-**keyless deployment to a target EC2 instance via AWS Systems Manager**
-&mdash; with the application host's SSH port permanently closed to the
-public internet.
+Every push to GitHub triggers a **13-job workflow** that runs unit tests,
+executes **seven integrated security gates** (secrets, two SAST engines,
+software-composition analysis, container image scanning, and two DAST
+scans) alongside AWS-native registry scanning, builds a hardened Docker
+image on a self-hosted runner, publishes it to a private Amazon ECR
+registry, deploys the running container to a **test** EC2 instance via AWS
+Systems Manager, dynamically scans it with **OWASP ZAP**, ships every
+report into a central **DefectDojo** engagement, and gates a final
+**production** deployment &mdash; with the application host's SSH port
+permanently closed to the public internet.
 
 The pipeline is engineered around four production-grade concerns:
 
-- **Shift-left security** &mdash; six scanners cover the full
-  build-to-runtime spectrum: source (`gitleaks`, `njsscan`, `semgrep`),
-  dependencies (`retire.js`), container image (`Trivy`), and the
-  registry itself (Amazon ECR Enhanced Scanning powered by Inspector).
-  Scan reports are also wired for one-shot import into a central
-  **DefectDojo** engagement via [`upload-report.py`](upload-report.py)
-  for human triage and SLA tracking.
+- **Shift-left *and* shift-right security** &mdash; seven scanners cover the
+  full build-to-runtime spectrum: source (`gitleaks`, `njsscan`, `semgrep`),
+  dependencies (`retire.js`), container image (`Trivy`), and the running
+  application (**OWASP ZAP** baseline + full DAST), backed by the registry
+  itself (Amazon ECR Enhanced Scanning powered by Inspector). Every report
+  is imported into a central **DefectDojo** engagement by the dedicated
+  `upload_reports` job via [`upload-report.py`](upload-report.py) for human
+  triage and SLA tracking.
 - **Zero-trust operations, zero static credentials** &mdash; the
   production EC2 host runs with **port 22 closed**. Deployments and
   break-glass shell access both go through **AWS Systems Manager
@@ -64,73 +69,67 @@ The pipeline is engineered around four production-grade concerns:
 ## Architecture
 
 ```text
-   ┌──────────────┐       ┌──────────────────────────────────────────────────────┐
-   │  Developer   │       │               GitHub Actions (9 jobs)                │
-   │   git push   │──────►│                                                      │
-   └──────────────┘       │  create_cache ──► yarn_test                          │
-                          │              │──► gitleaks   (secrets)               │
-                          │              │──► njsscan    (SAST → SARIF)          │
-                          │              │──► semgrep    (SAST)                  │
-                          │              │──► retire     (SCA)                   │
-                          │              ▼                                       │
-                          │      ┌────────────────────────────────────────────┐  │
-                          │      │  build_image  +  deploy_image              │  │
-                          │      │  ─────────────────────────────────         │  │
-                          │      │  runs-on: [self-hosted, juice-shop]        │  │
-                          │      │                                            │  │
-                          │      │       ┌────────────────────────────┐       │  │
-                          │      │       │  self-hosted-runner (EC2)  │       │  │
-                          │      │       │  IAM role: github-runner-  │       │  │
-                          │      │       │           role             │       │  │
-                          │      │       │    ├─ AmazonEC2Container-  │       │  │
-                          │      │       │    │  RegistryFullAccess   │       │  │
-                          │      │       │    └─ AmazonSSMFullAccess  │       │  │
-                          │      │       └─────┬──────────────┬───────┘       │  │
-                          │      └─────────────┼──────────────┼───────────────┘  │
-                          │                    │              │                  │
-                          │       docker push  │              │  aws ssm         │
-                          │       :sha+:latest │              │  send-command    │
-                          │                    ▼              │                  │
-                          │      ┌─────────────────────┐      │ ┌──────────────┐ │
-                          │      │ Amazon ECR (priv.)  │◄────►│ │ ECR Enhanced │ │
-                          │      │ juice-shop repo     │      │ │ Scanning     │ │
-                          │      └─────────┬───────────┘      │ │ (Inspector)  │ │
-                          │                │                  │ └──────────────┘ │
-                          │                ▼                  │                  │
-                          │      ┌─────────────────────┐      │                  │
-                          │      │  trivy image scan   │      │                  │
-                          │      └─────────────────────┘      │                  │
-                          └─────────────────────────────────-─┼──────────────────┘
-                                                              ▼
-                                ┌──────────────────────────────────────┐
-                                │           juice-app-server           │
-                                │     Ubuntu 26.04 / EC2 t2.micro      │
-                                │  IAM role: app-server-role           │
-                                │    ├─ AmazonSSMManagedInstanceCore   │
-                                │    └─ AmazonEC2ContainerRegistryFull │
-                                │                                      │
-                                │  amazon-ssm-agent  ──►  docker pull  │
-                                │                         docker run   │
-                                │                            :3000 ───►│ browser
-                                └──────────────────────────────────────┘
+   ┌──────────────┐   ┌──────────────────────────────────────────────────────────────┐
+   │  Developer   │   │                   GitHub Actions (13 jobs)                   │
+   │   git push   │──►│                                                              │
+   └──────────────┘   │  create_cache ─┬─► yarn_test  (unit tests)                   │
+                      │                ├─► gitleaks   (secrets)                      │
+                      │                ├─► njsscan    (SAST → SARIF)                 │
+                      │                ├─► semgrep    (SAST)                         │
+                      │                └─► retire     (SCA)                          │
+                      │                       │ (yarn_test+gitleaks+njsscan+semgrep) │
+                      │                       ▼                                      │
+                      │   ┌───────────────────────────────────────────────────────┐ │
+                      │   │  build_image  ──►  trivy        (image CVE scan)       │ │
+                      │   │       │       ──►  deploy_test  (aws ssm send-command) │ │
+                      │   │  runs-on: [self-hosted, juice-shop]                    │ │
+                      │   │       ┌────────────────────────────┐                   │ │
+                      │   │       │  self-hosted-runner (EC2)  │                   │ │
+                      │   │       │  IAM role: github-runner-  │                   │ │
+                      │   │       │           role             │                   │ │
+                      │   │       │    ├─ AmazonEC2Container-  │                   │ │
+                      │   │       │    │  RegistryFullAccess   │                   │ │
+                      │   │       │    └─ AmazonSSMFullAccess  │                   │ │
+                      │   │       └─────┬──────────────┬───────┘                   │ │
+                      │   └─────────────┼──────────────┼───────────────────────────┘ │
+                      │   docker push   │              │  aws ssm send-command        │
+                      │   :sha+:latest  ▼              ▼                              │
+                      │   ┌─────────────────────┐  ┌────────────────────────────┐     │
+                      │   │ Amazon ECR (priv.)  │  │ deploy_test → juice-app    │     │
+                      │   │ juice-shop repo     │  │ (test EC2, docker run)     │     │
+                      │   │  + ECR Enhanced     │  └──────────────┬─────────────┘     │
+                      │   │    Scanning (Insp.) │                 ▼                    │
+                      │   └─────────────────────┘  ┌────────────────────────────┐     │
+                      │                            │ zap_baseline │ zap_full    │     │
+                      │                            │  (OWASP ZAP DAST → XML)    │     │
+                      │                            └──────────────┬─────────────┘     │
+                      │                                           ▼                    │
+                      │   ┌──────────────────────────┐  ┌────────────────────────┐     │
+                      │   │ deploy_prod (production   │  │ upload_reports         │     │
+                      │   │  environment, gated)      │  │ → DefectDojo import    │     │
+                      │   └──────────────────────────┘  │   (all 7 reports)      │     │
+                      │                                 └────────────────────────┘     │
+                      └──────────────────────────────────────────────────────────────┘
 ```
 
 ## At a Glance
 
 | Capability                  | Implementation                                                                                                          |
 |-----------------------------|-------------------------------------------------------------------------------------------------------------------------|
-| **Pipeline orchestration**  | GitHub Actions, 9 jobs, fan-out / fan-in DAG, dual `ubuntu-latest` + self-hosted runner topology                        |
+| **Pipeline orchestration**  | GitHub Actions, 13 jobs, fan-out / fan-in DAG, dual `ubuntu-latest` + self-hosted runner topology                       |
 | **Secrets scanning**        | `gitleaks` against full git history (`fetch-depth: 0`)                                                                  |
 | **SAST**                    | `njsscan` (Node-specific, SARIF → GitHub Code Scanning) + `semgrep` (`p/javascript` ruleset)                            |
 | **Dependency scanning**     | `retire.js` against `node_modules`                                                                                      |
-| **Container image scanning**| `Trivy` against the freshly pushed ECR image, gated on HIGH / CRITICAL severities                                       |
+| **Container image scanning**| `Trivy` against the freshly pushed ECR image, gated on HIGH / CRITICAL severities (`--ignore-unfixed`)                  |
+| **DAST**                    | **OWASP ZAP** baseline + full active scan against the live `deploy_test` container; XML reports imported to DefectDojo   |
 | **Registry-side scanning**  | Amazon ECR **Enhanced Scanning** (Amazon Inspector) &mdash; continuous, OS-package + language-package CVE coverage      |
-| **Vulnerability management**| Scan reports normalised for **DefectDojo** import via [`upload-report.py`](upload-report.py) (Gitleaks / SARIF / Semgrep / Retire.js / Trivy) for triage and SLA tracking |
+| **Vulnerability management**| All reports imported to **DefectDojo** engagement `14` by the `upload_reports` job via [`upload-report.py`](upload-report.py) (Gitleaks / SARIF / Semgrep / Retire.js / Trivy / ZAP ×2) for triage and SLA tracking |
 | **Vulnerability remediation**| Hands-on CVE fix: upgraded `express-jwt` `0.1.3 → 6.0.0` to break the vulnerable transitive `jsonwebtoken` chain (CVE-2015-9235) |
 | **Image hardening**         | Multi-stage Dockerfile, non-root user (`USER 65532`), slim runtime base (`node:18-bookworm-slim`), final image ≈ 214 MB |
 | **Test execution**          | `yarn test` (Juice Shop unit suite) gated before image build                                                            |
 | **Image registry**          | Private Amazon ECR repository, dual-tagged `:${{ github.sha }}` + `:latest`                                             |
 | **Caching strategy**        | (1) `actions/cache` for `node_modules` / `.yarn` keyed on `yarn.lock`, (2) registry-based Docker BuildKit               |
+| **Deployment stages**       | `deploy_test` (SSM → test EC2) → ZAP DAST → gated `deploy_prod` (`production` environment)                              |
 | **Deployment transport**    | **AWS Systems Manager Session Manager** (`aws ssm send-command`) &mdash; no SSH, no port 22, no static keys             |
 | **App-host identity**       | EC2 instance profile `app-server-role` &mdash; `AmazonSSMManagedInstanceCore` + `AmazonEC2ContainerRegistryFullAccess`  |
 | **CI-runner identity**      | EC2 instance profile `github-runner-role` &mdash; `AmazonEC2ContainerRegistryFullAccess` + `AmazonSSMFullAccess`        |
@@ -140,7 +139,7 @@ The pipeline is engineered around four production-grade concerns:
 ## Live Deployment
 
 Once the pipeline succeeds, the application is served from a containerised
-distroless Node.js image on a dedicated EC2 instance:
+hardened `node:18-bookworm-slim` image on a dedicated EC2 instance:
 
 > :globe_with_meridians: **`http://18.118.27.38:3000/`**
 
@@ -150,8 +149,9 @@ distroless Node.js image on a dedicated EC2 instance:
 
 ```text
 .
-├── .github/workflows/ci.yml      ← 8-stage CI/CD pipeline definition
-├── Dockerfile                    ← Multi-stage build, distroless runtime
+├── .github/workflows/ci.yml      ← 13-job CI/CD pipeline definition
+├── upload-report.py              ← Normalises each scan report and imports it to DefectDojo
+├── Dockerfile                    ← Multi-stage build, node:18-bookworm-slim runtime
 ├── screenshots/                  ← Pipeline run + deployment evidence
 ├── frontend/                     ← Juice Shop Angular UI (upstream)
 ├── routes/, models/, lib/        ← Juice Shop Node.js backend (upstream)
@@ -171,6 +171,9 @@ distroless Node.js image on a dedicated EC2 instance:
   - [Centralised Triage in DefectDojo](#centralised-triage-in-defectdojo)
   - [Case Study &mdash; Remediating CVE-2015-9235 (`jsonwebtoken`)](#case-study--remediating-cve-2015-9235-jsonwebtoken)
   - [Base Image Hardening &mdash; `distroless` → `node:18-bookworm-slim`](#base-image-hardening--distroless--node18-bookworm-slim)
+- [Dynamic Application Security Testing (OWASP ZAP)](#dynamic-application-security-testing-owasp-zap)
+  - [The `zap_baseline` and `zap_full` Jobs](#the-zap_baseline-and-zap_full-jobs)
+  - [Importing ZAP Results into DefectDojo](#importing-zap-results-into-defectdojo)
 - [Secure Continuous Deployment via AWS Systems Manager](#secure-continuous-deployment-via-aws-systems-manager)
   - [Why SSM Instead of SSH](#why-ssm-instead-of-ssh)
   - [Verifying the SSM Agent](#verifying-the-ssm-agent)
@@ -179,7 +182,8 @@ distroless Node.js image on a dedicated EC2 instance:
   - [The `github-runner-role` IAM Role (CI-Runner Side)](#the-github-runner-role-iam-role-ci-runner-side)
   - [Attaching the Roles to the EC2 Instances](#attaching-the-roles-to-the-ec2-instances)
   - [Connecting to the Host via Session Manager](#connecting-to-the-host-via-session-manager)
-  - [The `deploy_image` Job &mdash; `aws ssm send-command`](#the-deploy_image-job--aws-ssm-send-command)
+  - [The `deploy_test` Job &mdash; `aws ssm send-command`](#the-deploy_test-job--aws-ssm-send-command)
+  - [The `deploy_prod` Job &mdash; Gated Production Release](#the-deploy_prod-job--gated-production-release)
 - [Release Deployment](#release-deployment)
   - [Provisioning the Application EC2 Instance (`juice-app-server`)](#provisioning-the-application-ec2-instance-juice-app-server)
   - [Installing Docker and the AWS CLI](#installing-docker-and-the-aws-cli)
@@ -206,49 +210,56 @@ The pipeline is defined in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and triggers on
 every `push`. It is organised as a fan-out of independent quality and
 security gates after a shared dependency-cache stage, followed by a
-sequential build-and-release fan-in:
+build → deploy-to-test → DAST → report-and-promote fan-in:
 
 ```text
-                 ┌─► yarn_test ─┐                       ┌─► trivy           (post-build scan)
-                 ├─► gitleaks ──┤                       │
- create_cache ──►┼─► njsscan ───┼──► build_image ──────►┤
-                 ├─► semgrep ───┤                       │
-                 └─► retire ────┘                       └─► deploy_image    (via AWS SSM)
+                 ┌─► yarn_test ─┐                     ┌─► trivy         (post-build image scan)
+                 ├─► gitleaks ──┤                     │
+ create_cache ──►┼─► njsscan ───┼──► build_image ─────┤                ┌─► zap_baseline ─┐
+                 ├─► semgrep ───┤                     └─► deploy_test ──┤                 ├─► deploy_prod
+                 └─► retire ────┘                        (via AWS SSM)  └─► zap_full ─────┘   (gated)
+                                                                              │
+       all reports ──────────────────────────────────────────────────────────┴─► upload_reports → DefectDojo
 ```
 
 ### Pipeline Jobs
 
-Each job runs in its own container (or on the self-hosted runner for
-`build_image`) so failures are isolated and tool versions are pinned.
+Each job runs in its own container (or on the self-hosted runner for the
+build / deploy / DAST stages) so failures are isolated and tool versions
+are pinned.
 
-| Job             | Runner                                   | Purpose                                                                                                              | Failure policy                                       |
-|-----------------|------------------------------------------|----------------------------------------------------------------------------------------------------------------------|------------------------------------------------------|
-| `create_cache`  | `ubuntu-latest` (`node:18-bullseye`)     | Restores or hydrates the `node_modules` + `.yarn` cache keyed by `yarn.lock` so downstream jobs skip a full install. | Blocks pipeline on failure                           |
-| `yarn_test`     | `ubuntu-latest` (`node:18-bullseye`)     | Installs deps (cache hit) and runs `yarn test` &mdash; the Juice Shop unit suite.                                    | Blocks `build_image`                                 |
-| `gitleaks`      | `ubuntu-latest` (`zricethezav/gitleaks`) | Scans the full git history (`fetch-depth: 0`) for committed secrets; uploads `gitleaks.json` artifact.               | `continue-on-error: true` &mdash; reported, non-blocking |
-| `njsscan`       | `ubuntu-latest`                          | Node.js-specific SAST via `ajinabraham/njsscan-action`; uploads SARIF to GitHub code scanning and as an artifact.    | Blocks `build_image` on warnings                     |
-| `semgrep`       | `ubuntu-latest` (`semgrep/semgrep`)      | Generic SAST using the `p/javascript` ruleset; uploads `semgrep.json`.                                               | `continue-on-error: true`                            |
-| `retire`        | `ubuntu-latest` (`node:18-bullseye`)     | `retire.js` scan for known-vulnerable JavaScript dependencies; uploads `retire.json`.                                | `continue-on-error: true`                            |
-| `build_image`   | `self-hosted, juice-shop`                | Builds the Docker image and pushes both `:${{ github.sha }}` and `:latest` to ECR.                                   | Blocks `trivy` & `deploy_image`                      |
-| `trivy`         | `ubuntu-latest` (`aquasec/trivy`)        | Pulls the freshly pushed image from ECR and scans for HIGH / CRITICAL CVEs; uploads `trivy.json` artifact.           | `continue-on-error: true` &mdash; reported, non-blocking |
-| `deploy_image`  | `self-hosted, juice-shop`                | Issues `aws ssm send-command` against the app-server instance ID to pull the new image and recreate the container &mdash; **no SSH**. | Final stage                                          |
+| Job              | Runner                                   | Purpose                                                                                                              | Failure policy                                       |
+|------------------|------------------------------------------|----------------------------------------------------------------------------------------------------------------------|------------------------------------------------------|
+| `create_cache`   | `ubuntu-latest` (`node:18-bullseye`)     | Restores or hydrates the `node_modules` + `.yarn` cache keyed by `yarn.lock` so downstream jobs skip a full install. | Blocks pipeline on failure                           |
+| `yarn_test`      | `ubuntu-latest` (`node:18-bullseye`)     | Installs deps (cache hit) and runs `yarn test` &mdash; the Juice Shop unit suite.                                    | Blocks `build_image`                                 |
+| `gitleaks`       | `ubuntu-latest` (`zricethezav/gitleaks`) | Scans the full git history (`fetch-depth: 0`) for committed secrets; uploads `gitleaks.json` artifact.               | `continue-on-error: true` &mdash; reported, non-blocking |
+| `njsscan`        | `ubuntu-latest`                          | Node.js-specific SAST via `ajinabraham/njsscan-action`; uploads SARIF to GitHub code scanning and as an artifact.    | Blocks `build_image` on warnings                     |
+| `semgrep`        | `ubuntu-latest` (`semgrep/semgrep`)      | Generic SAST using the `p/javascript` ruleset; uploads `semgrep.json`.                                               | `continue-on-error: true`                            |
+| `retire`         | `ubuntu-latest` (`node:18-bullseye`)     | `retire.js` scan for known-vulnerable JavaScript dependencies; uploads `retire.json`.                                | `continue-on-error: true`                            |
+| `build_image`    | `self-hosted, juice-shop`                | Builds the Docker image and pushes both `:${{ github.sha }}` and `:latest` to ECR. Needs `yarn_test`, `gitleaks`, `njsscan`, `semgrep`. | Blocks `trivy` & `deploy_test`         |
+| `trivy`          | `self-hosted, juice-shop`                | Installs Trivy, logs in to ECR, and scans the SHA-tagged image for HIGH / CRITICAL CVEs (`--ignore-unfixed`); uploads `trivy.json`. | `continue-on-error: true` &mdash; reported, non-blocking |
+| `deploy_test`    | `self-hosted, juice-shop`                | Issues `aws ssm send-command` against the test app-server instance ID to pull `:latest` and recreate the container &mdash; **no SSH**. | Blocks the ZAP DAST jobs               |
+| `zap_baseline`   | `self-hosted, juice-shop` (`zaproxy`)    | Runs `zap-baseline.py` (passive DAST) against the live test container; uploads `baseline.xml`.                       | `-I` &mdash; informational, does not fail the job    |
+| `zap_full`       | `self-hosted, juice-shop` (`zaproxy`)    | Runs `zap-full-scan.py` (active DAST) against the live test container; uploads `zap.xml`.                            | `-I` &mdash; informational, does not fail the job    |
+| `upload_reports` | `ubuntu-latest` (`python:3`)             | Downloads every scan artifact and POSTs each into DefectDojo engagement `14` via `upload-report.py`. `if: always()`.| Best-effort aggregation                              |
+| `deploy_prod`    | `self-hosted, juice-shop`                | Gated on the `production` GitHub Environment; promotes the release after `zap_baseline` passes.                      | Final stage                                          |
 
-The recent successful runs
-([`#103`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/26548881468),
-[`#104`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/26549793818))
-show the expected steady-state behaviour: `gitleaks`, `semgrep`, and
-`retire` report findings (visible in the Annotations panel) but
-`continue-on-error: true` keeps them from blocking the release, while
-`yarn_test` and `njsscan` must pass for `build_image` to start.
+The recent successful run
+[`#189`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/28909252719)
+("Zap baseline/full scan deployment") shows the expected steady-state
+behaviour: `gitleaks`, `semgrep`, `retire`, and `trivy` report findings
+(visible in the Annotations panel) but `continue-on-error: true` keeps
+them from blocking the release, while `yarn_test` and `njsscan` must pass
+for `build_image` to start. After `deploy_test` lands the container, both
+ZAP scans run, and `upload_reports` fans every report into DefectDojo:
 
-![CI run #103 — full pipeline, 15m 7s end-to-end](screenshots/release-pipeline-run.png)
+![CI run #189 — full 13-job pipeline including ZAP DAST and DefectDojo upload-reports, 22m 1s end-to-end](screenshots/pipeline-zap-dast.png)
 
-The re-run (`#104`) demonstrates the value of the registry-based build
-cache enabled in commit `d3b03ba` &mdash; total duration drops from
-**15&nbsp;m&nbsp;7&nbsp;s → 4&nbsp;m&nbsp;44&nbsp;s**, with `build_image`
-falling from `10m 44s` to `8s` because every Docker layer hits cache:
+The registry-based build cache enabled in commit `d3b03ba` keeps
+re-builds fast &mdash; `build_image` falls from `10m 44s` to a handful of
+seconds when every Docker layer hits cache:
 
-![CI run #104 — re-run benefits from registry build cache, 4m 44s end-to-end](screenshots/release-pipeline-run-1.png)
+![CI run — re-run benefits from registry build cache](screenshots/release-pipeline-run-1.png)
 
 #### Caching Strategy
 
@@ -263,12 +274,13 @@ The cache key rolls automatically whenever `yarn.lock` changes, and the
 
 Every security gate uploads its raw report as a workflow artifact
 (`gitleaks-report`, `njsscan.sarif`, `semgrep.json`, `retire.json`,
-`trivy.json`). The companion script
-[`upload-report.py`](upload-report.py) normalises each format and
-imports it into DefectDojo through its REST API; it can be wired
-into the workflow as a follow-up job whenever the
-`DEFECTDOJO_API_KEY` secret is provisioned, or invoked manually
-against the downloaded artifacts.
+`trivy.json`, `zap-baseline`, `zap-full`). The dedicated
+`upload_reports` job (`if: always()`) then downloads all seven and
+runs the companion script [`upload-report.py`](upload-report.py) once
+per report, mapping each format to its DefectDojo scan type and POSTing
+it into engagement `14` through the platform's REST API. The
+`DEFECTDOJO_API_KEY` is provided as a GitHub Actions secret, so the
+import is fully automated on every push &mdash; no manual step.
 
 ### Building and Pushing the Image to AWS ECR
 
@@ -288,7 +300,7 @@ comfortably accommodate. The steps:
 5. Push both tags to ECR.
 
 The SHA tag pins a known-good build for rollback; `:latest` is the
-moving pointer the `deploy_image` stage consumes.
+moving pointer the `deploy_test` stage consumes.
 
 The deployment stage and the bootstrap of the application host are
 documented in [Release Deployment](#release-deployment) below.
@@ -306,46 +318,49 @@ DefectDojo.
 
 | Layer            | Scanner                       | Where it runs                  | What it catches                                          |
 |------------------|-------------------------------|--------------------------------|----------------------------------------------------------|
-| CI image scan    | **Trivy**                     | GitHub Actions, post-`build_image` | OS package CVEs + language package CVEs in the freshly pushed image |
+| CI image scan    | **Trivy**                     | Self-hosted runner, post-`build_image` | OS package CVEs + language package CVEs in the freshly pushed image |
 | Registry scan    | **Amazon ECR Enhanced Scanning** (Inspector) | Continuous, AWS-managed | Same coverage as Trivy, but re-runs automatically whenever the CVE database changes &mdash; without re-running the pipeline |
-| Triage / SLA     | **DefectDojo**                | Hosted demo instance           | De-duplication, severity-based SLA tracking, risk-acceptance workflow, single pane of glass for all five scanners |
+| DAST             | **OWASP ZAP**                 | Self-hosted runner, post-`deploy_test` | Runtime vulnerabilities in the *live* container (missing security headers, CSP gaps, information disclosure, injection) |
+| Triage / SLA     | **DefectDojo**                | Hosted demo instance           | De-duplication, severity-based SLA tracking, risk-acceptance workflow, single pane of glass for all seven scanners |
 
-![CI run #134 — full pipeline including Trivy image scan and DefectDojo upload-reports](screenshots/pipeline-with-trivy.png)
+![CI run #189 — full 13-job pipeline including Trivy, ZAP DAST, and DefectDojo upload-reports, 22m 1s end-to-end](screenshots/pipeline-zap-dast.png)
 
-> :information_source: The screenshot above shows pipeline run **#134**
-> &mdash; the post-Trivy / post-DefectDojo topology. End-to-end duration
-> is now 20&nbsp;m&nbsp;32&nbsp;s with the additional scan and upload
-> stages; the deploy-image hot path itself remains a few seconds
-> because of the registry-based build cache.
+> :information_source: The screenshot above shows pipeline run **#189**
+> &mdash; the post-Trivy / post-ZAP / post-DefectDojo topology.
+> End-to-end duration is 22&nbsp;m&nbsp;1&nbsp;s with the added image
+> scan, deploy, DAST, and upload stages; the `deploy_test` hot path
+> itself remains a few seconds because of the registry-based build
+> cache.
 
 ### Trivy &mdash; CI-side Container Image Scanning
 
-The `trivy` job runs immediately after `build_image` so that the
-*exact bytes* that were just pushed to ECR are scanned, not a local
-rebuild:
+The `trivy` job runs on the self-hosted runner immediately after
+`build_image`, so that the *exact bytes* that were just pushed to ECR
+are scanned by their SHA tag:
 
 ```yaml
 trivy:
   name: Trivy Image Scan
-  runs-on: ubuntu-latest
+  runs-on: [self-hosted, juice-shop]
   continue-on-error: true
   needs: build_image
-  container:
-    image: aquasec/trivy:latest
-    options: --entrypoint ""
   steps:
-    - run: apk --no-cache add aws-cli
+    - name: Install Trivy
+      run: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+          | sh -s -- -b $HOME/.local/bin
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: Log in to ECR
       run: |
-        aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
-        trivy registry login \
-          --username AWS --password-stdin \
-          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+        aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+          | docker login --username AWS --password-stdin \
+              $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
     - name: Run Trivy scan
       run: |
         trivy image \
           --severity HIGH,CRITICAL \
           --exit-code 1 \
+          --ignore-unfixed \
           -f json -o trivy.json \
           $IMAGE_NAME:${{ github.sha }}
     - name: Upload Trivy report
@@ -361,9 +376,13 @@ Design notes:
 - **Scan the SHA-tagged image, not `:latest`.** The SHA tag is
   immutable; `:latest` could move between push and scan in a high-
   throughput repo.
-- **Trivy authenticates to ECR through its native `trivy registry
-  login`** &mdash; no need to docker-pull the image first, which would
-  burn runner disk and bandwidth.
+- **Runs on the self-hosted runner**, which already carries the
+  `github-runner-role` instance profile &mdash; so `aws ecr
+  get-login-password` and `docker login` authenticate keylessly through
+  the EC2 metadata service.
+- **`--ignore-unfixed`** trims the report to CVEs that actually have a
+  fix available, keeping the DefectDojo queue focused on actionable
+  findings rather than un-patchable upstream noise.
 - **`--exit-code 1` flips the job red** on any HIGH/CRITICAL finding,
   while `continue-on-error: true` keeps the pipeline moving so the
   finding still flows into DefectDojo for human triage. This is the
@@ -396,13 +415,12 @@ The combination is deliberate:
 
 ### Centralised Triage in DefectDojo
 
-Five scanners producing five different JSON / SARIF formats is
+Seven scanners producing five different JSON / SARIF / XML formats is
 unmanageable without aggregation. The companion helper
-[`upload-report.py`](upload-report.py) normalises every report and
-POSTs it into a single DefectDojo engagement via the platform's
-REST API. It can be invoked as a follow-up workflow job, run from
-a maintainer's workstation against the downloaded artifacts, or
-scheduled out-of-band on a cadence:
+[`upload-report.py`](upload-report.py) takes a report filename as its
+single argument, maps it to the matching DefectDojo scan type, and POSTs
+it into a single engagement via the platform's REST API. The
+`upload_reports` job calls it once per artifact:
 
 ```python
 # upload-report.py (excerpt)
@@ -411,6 +429,8 @@ elif file_name == 'njsscan.sarif':  scan_type = 'SARIF'
 elif file_name == 'semgrep.json':   scan_type = 'Semgrep JSON Report'
 elif file_name == 'retire.json':    scan_type = 'Retire.js Scan'
 elif file_name == 'trivy.json':     scan_type = 'Trivy Scan'
+elif file_name == 'baseline.xml':   scan_type = 'ZAP Scan'   # ZAP baseline DAST
+elif file_name == 'zap.xml':        scan_type = 'ZAP Scan'   # ZAP full DAST
 
 url = 'https://demo.defectdojo.org/api/v2/import-scan/'
 data = {
@@ -418,29 +438,33 @@ data = {
     'verified': True,
     'scan_type': scan_type,
     'minimum_severity': 'Low',
-    'engagement': 2,
+    'engagement': 14,
 }
 files = {'file': open(file_name, 'rb')}
 response = requests.post(url, headers=headers, data=data, files=files)
 ```
 
 The `DEFECTDOJO_API_KEY` is supplied as a GitHub Actions secret;
-no credentials live in the script or the repository.
+no credentials live in the script or the repository. Both ZAP reports
+(`baseline.xml`, `zap.xml`) map to the same `ZAP Scan` type and land as
+two separate tests in the engagement.
 
 After a successful pipeline, a single DefectDojo engagement holds
 the full per-scanner test list with normalised severity, CWE
-mapping, and de-duplication:
+mapping, and de-duplication &mdash; here, engagement `14` (Juice-app 1.1)
+with **7 tests** (Gitleaks, Retire.js, Semgrep, Trivy, ZAP ×2, nodejsscan
+SARIF) and 183 active findings (30 Critical, 101 High, 43 Medium, 9 Low):
 
-![DefectDojo engagement for release version 1.1.1 — 5 imported tests (Gitleaks, Retire.js, Semgrep, Trivy, nodejsscan SARIF), 168 active findings](screenshots/defectdojo-all-scans.png)
+![DefectDojo engagement 14 (Juice-app 1.1) — 7 imported tests (Gitleaks, Retire.js, Semgrep, Trivy, ZAP ×2, nodejsscan SARIF), 183 active findings](screenshots/defectdojo-engagement-14.png)
 
 Drilling into the Trivy test exposes every container CVE with CWE
 references, EPSS scores, fixed-in versions, and a per-finding SLA
 clock:
 
-![DefectDojo Trivy Scan findings — 114 container CVEs with severity, CWE, and Vulnerability ID columns](screenshots/defectdojo-trivy-findings.png)
+![DefectDojo Trivy Scan findings — container CVEs with severity, CWE, and Vulnerability ID columns](screenshots/defectdojo-trivy-findings.png)
 
 This is what closes the DevSecOps loop: a developer no longer has
-to read five raw JSON files to know what changed in their risk
+to read seven raw report files to know what changed in their risk
 posture between commits &mdash; they read one engagement.
 
 ### Case Study &mdash; Remediating CVE-2015-9235 (`jsonwebtoken`)
@@ -543,6 +567,128 @@ the scanners make the cost of the friendlier base image
 
 ---
 
+## Dynamic Application Security Testing (OWASP ZAP)
+
+Everything up to this point scans code, dependencies, and the image
+*at rest*. **DAST** closes the last gap by attacking the application
+*while it runs*. Once `deploy_test` has a live container answering on
+port 3000, two [OWASP ZAP](https://www.zaproxy.org/) jobs probe it
+from the outside &mdash; exactly as an unauthenticated attacker would
+&mdash; catching runtime issues no static scanner can see: missing or
+misconfigured security headers, CSP gaps, cross-domain
+misconfiguration, information disclosure, and (in the full scan)
+active injection attempts.
+
+Both jobs run **after** `deploy_test` and target the deployed test
+instance, not the source tree:
+
+```text
+deploy_test ──► zap_baseline  (passive spider + passive rules)
+            └─► zap_full      (passive + active attack rules)
+```
+
+### The `zap_baseline` and `zap_full` Jobs
+
+Both jobs run the official `ghcr.io/zaproxy/zaproxy:stable` container
+on the self-hosted runner and write a JUnit-style XML report that the
+`upload_reports` job later ships to DefectDojo:
+
+```yaml
+zap_baseline:
+  runs-on: [self-hosted, juice-shop]
+  needs: deploy_test
+  container:
+    image: ghcr.io/zaproxy/zaproxy:stable
+  env:
+    ZAP_TARGET: "http://<test-host-ip>:3000"
+  steps:
+    - uses: actions/checkout@v4
+    - name: Prepare ZAP workspace
+      run: mkdir -p /zap/wrk
+    - name: Run ZAP Baseline Scan
+      run: |
+        zap-baseline.py -t "$ZAP_TARGET" -g gen.conf -I -x baseline.xml
+        cp /zap/wrk/baseline.xml $GITHUB_WORKSPACE/baseline.xml
+    - name: Upload Baseline Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zap-baseline
+        path: ${{ github.workspace }}/baseline.xml
+
+zap_full:
+  runs-on: [self-hosted, juice-shop]
+  needs: deploy_test
+  container:
+    image: ghcr.io/zaproxy/zaproxy:stable
+  env:
+    ZAP_TARGET: "http://<test-host-ip>:3000"
+  steps:
+    - uses: actions/checkout@v4
+    - name: Prepare ZAP workspace
+      run: mkdir -p /zap/wrk
+    - name: Run ZAP full Scan
+      run: |
+        zap-full-scan.py -t "$ZAP_TARGET" -g gen.conf -I -x zap.xml
+        cp /zap/wrk/zap.xml $GITHUB_WORKSPACE/zap.xml
+    - name: Upload full scan Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zap-full
+        path: ${{ github.workspace }}/zap.xml
+```
+
+Design notes:
+
+- **Baseline vs. full.** `zap-baseline.py` spiders the target and runs
+  only *passive* rules &mdash; fast (~1–2 min) and safe to run on every
+  push. `zap-full-scan.py` adds ZAP's *active* attack rules (injection,
+  path traversal, etc.), which are slower and genuinely send malicious
+  payloads &mdash; appropriate against a disposable **test** instance,
+  never against production.
+- **`-I` (informational).** Both scans pass `-I`, which tells ZAP *not*
+  to return a non-zero exit code on warnings. This keeps the DAST jobs
+  green so findings flow into DefectDojo for triage rather than hard-
+  failing the pipeline &mdash; the same *report-now-fail-later* posture
+  used for the SAST/SCA gates.
+- **`-g gen.conf`** seeds/generates a ZAP config file so individual
+  rules can be tuned to `IGNORE`/`WARN`/`FAIL` over time as the team
+  triages noise.
+- **`-x baseline.xml` / `-x zap.xml`** emit the machine-readable XML
+  report that `upload-report.py` maps to DefectDojo's `ZAP Scan` type.
+
+A typical baseline run summary reports the passive findings ZAP
+raises against Juice Shop &mdash; missing CSP header, deprecated
+feature-policy header, cross-domain misconfiguration, dangerous JS
+functions, and timestamp disclosure, all `WARN-NEW`:
+
+```text
+WARN-NEW: Content Security Policy (CSP) Header Not Set [10038] x 5
+WARN-NEW: CSP: Failure to Define Directive with No Fallback [10055] x 6
+WARN-NEW: Cross-Domain Misconfiguration [10098] x 11
+WARN-NEW: Deprecated Feature Policy Header Set [10063] x 11
+WARN-NEW: Dangerous JS Functions [10110] x 2
+FAIL-NEW: 0   FAIL-INPROG: 0   WARN-NEW: 8   WARN-INPROG: 0   INFO: 0   IGNORE: 0   PASS: 58
+```
+
+The same summary in the `zap_baseline` job log &mdash; 8 `WARN-NEW`
+findings, 58 rules passed, and `FAIL-NEW: 0` (because of the `-I`
+flag the job stays green while the findings are captured for import):
+
+![zap_baseline job log — WARN-NEW findings (CSP not set, CSP no-fallback, deprecated feature policy, cross-domain misconfiguration, dangerous JS functions, timestamp disclosure) with FAIL-NEW: 0 / WARN-NEW: 8 / PASS: 58](screenshots/zap-baseline-scan.png)
+
+### Importing ZAP Results into DefectDojo
+
+Because both `baseline.xml` and `zap.xml` are ZAP XML, they map to the
+same DefectDojo `ZAP Scan` type in [`upload-report.py`](upload-report.py)
+and are imported as two separate tests in engagement `14`. In the
+DefectDojo engagement they appear as the two `ZAP Scan` rows alongside
+the SAST/SCA/Trivy tests, giving DAST findings the same de-duplication,
+severity normalisation, and SLA clock as every other scanner.
+
+---
+
 ## Secure Continuous Deployment via AWS Systems Manager
 
 The deploy stage no longer ships code over SSH. The application
@@ -600,7 +746,7 @@ The pipeline needs to do four AWS-authenticated operations:
 | Operation                              | Where it runs                | Done by                |
 |----------------------------------------|------------------------------|------------------------|
 | `docker push` to ECR                   | `build_image` on the runner  | `github-runner-role`   |
-| `aws ssm send-command`                 | `deploy_image` on the runner | `github-runner-role`   |
+| `aws ssm send-command`                 | `deploy_test` on the runner  | `github-runner-role`   |
 | `docker pull` from ECR                 | the app host (via SSM)       | `app-server-role`      |
 | Receive Session Manager / RunShellScript | the app host (SSM agent)    | `app-server-role`      |
 
@@ -617,7 +763,7 @@ authentication is delegated to the EC2 metadata service entirely:
 > rotated every few hours by AWS), and signs the request with
 > them. The application code &mdash; whether that's `docker
 > login` calling `aws ecr get-login-password` inside
-> `build_image`, or `aws ssm send-command` inside `deploy_image`
+> `build_image`, or `aws ssm send-command` inside `deploy_test`
 > &mdash; never has to read a credential file or an environment
 > variable. The role *is* the credential.
 
@@ -661,7 +807,7 @@ to it borrow AWS permissions transparently:
 | Managed policy                          | Why it is required                                                                                            |
 |-----------------------------------------|---------------------------------------------------------------------------------------------------------------|
 | `AmazonEC2ContainerRegistryFullAccess`  | Lets `build_image` push the freshly built Docker image to ECR with no static keys.                            |
-| `AmazonSSMFullAccess`                   | Lets `deploy_image` issue `aws ssm send-command` and `aws ssm get-command-invocation` against the app-host instance ID. |
+| `AmazonSSMFullAccess`                   | Lets `deploy_test` issue `aws ssm send-command` and `aws ssm get-command-invocation` against the app-host instance ID. |
 
 Because the runner is registered with GitHub Actions as a
 self-hosted runner under a system user that inherits the EC2
@@ -726,18 +872,21 @@ cannot match without bolt-on tooling.
 With this in place, the `app-server-key.pem` workstation key and
 the `SSH_PRIVATE_KEY` GitHub Actions secret are both retired.
 
-### The `deploy_image` Job &mdash; `aws ssm send-command`
+### The `deploy_test` Job &mdash; `aws ssm send-command`
 
-The CI side of the new deploy path lives in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+The CI side of the deploy path lives in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). It runs after
+`build_image` and lands the freshly pushed `:latest` image on the test
+EC2 instance, which the ZAP DAST jobs then scan:
 
 ```yaml
-deploy_image:
+deploy_test:
   runs-on: [self-hosted, juice-shop]
   needs: build_image
   steps:
     - name: Deploy via SSM
       run: |
+        IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/juice-shop"
         LOG_IN_CMD="export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}; \
                     aws ecr get-login-password \
                     | docker login --username AWS --password-stdin \
@@ -750,7 +899,7 @@ deploy_image:
                                  -p 3000:3000 ${IMAGE_NAME}:latest"
 
         COMMAND_ID=$(aws ssm send-command \
-                       --instance-ids "i-0a81ff2840891c8f7" \
+                       --instance-ids "i-0a8499a03cd3cf6c4" \
                        --document-name "AWS-RunShellScript" \
                        --parameters "commands=[$LOG_IN_CMD, $COMMAND_TO_EXECUTE]" \
                        --query "Command.CommandId" --output text)
@@ -758,7 +907,7 @@ deploy_image:
         sleep 15
         aws ssm get-command-invocation \
           --command-id "$COMMAND_ID" \
-          --instance-id "i-0a81ff2840891c8f7"
+          --instance-id "i-0a8499a03cd3cf6c4"
 ```
 
 Engineering notes:
@@ -770,11 +919,11 @@ Engineering notes:
   The job needs no `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
   in `env:` &mdash; and those secrets have been deleted from the
   repository's Actions secret store entirely.
-- **The instance ID is the target**, not the IP &mdash; this
-  removes a long-standing fragility where re-launching the EC2
-  host changed its public IP and silently broke the SSH-based
+- **The instance ID is the target** (`i-0a8499a03cd3cf6c4`), not the
+  IP &mdash; this removes a long-standing fragility where re-launching
+  the EC2 host changed its public IP and silently broke the SSH-based
   deploy until the workflow file was patched (visible in the git
-  history: four consecutive `updated instance id` commits).
+  history: several consecutive `updated instance id` commits).
 - **`AWS-RunShellScript`** is the AWS-managed SSM Document; no
   custom document needs to be authored or versioned.
 - The `sleep 15` + `aws ssm get-command-invocation` pair gives
@@ -782,19 +931,45 @@ Engineering notes:
   GitHub Actions log so failed deploys are visible without
   hopping into the SSM console.
 
-The end-to-end result is visible in pipeline run
-[`#171`](https://github.com/OkomaNdu/juice-shop-devsecops-pipelin/actions/runs/27516360696)
-("deployment using ssm to ec2 instance and github-runner"):
-`build_image` and `deploy_image` both run on the runner, both
-land green, neither references an AWS key:
+`build_image` and `deploy_test` both run on the runner, both land
+green, and neither references an AWS key:
 
-![CI run #171 — build_image (12m 40s) and deploy_image (19s) both run on the IAM-roled self-hosted runner with zero AWS secrets in env](screenshots/pipeline-ssm-deploy.png)
+![CI run — build_image and deploy_test both run on the IAM-roled self-hosted runner with zero AWS secrets in env](screenshots/pipeline-ssm-deploy.png)
+
+### The `deploy_prod` Job &mdash; Gated Production Release
+
+`deploy_test` puts the build on a disposable instance so ZAP can attack
+it safely. Promotion to production is a **separate, gated** job:
+
+```yaml
+deploy_prod:
+  runs-on: [self-hosted, juice-shop]
+  needs: [zap_baseline]
+  environment: production
+  steps:
+    - name: Deploy to production
+      run: echo "deploying to production environment"
+```
+
+Design intent:
+
+- **`environment: production`** binds the job to a GitHub
+  [Environment](https://docs.github.com/en/actions/deployment/targeting-different-environments),
+  which can enforce required reviewers, wait timers, and branch
+  protection before the job is allowed to run &mdash; a human
+  approval gate between "scanned in test" and "live in production".
+- **`needs: [zap_baseline]`** makes a clean DAST baseline a
+  precondition for promotion, so the production release is gated on
+  the dynamic scan of the test instance.
+- The current step is a **placeholder** (`echo`) &mdash; the same
+  SSM `send-command` pattern used by `deploy_test` would target the
+  production instance ID here once that host is provisioned.
 
 ---
 
 ## Release Deployment
 
-The release stage of the pipeline (`build_image` → `deploy_image` in
+The release stage of the pipeline (`build_image` → `deploy_test` in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the Juice
 Shop Docker image on a self-hosted runner, pushes it to Amazon ECR
 (`991776826356.dkr.ecr.us-east-2.amazonaws.com/juice-shop`), and uses
@@ -805,7 +980,7 @@ without ever opening an SSH connection (see
 for the transport-level details).
 
 This section documents the one-time bootstrap performed on the target
-EC2 host so that the pipeline's `deploy_image` job has everything it
+EC2 host so that the pipeline's `deploy_test` job has everything it
 needs to land a release.
 
 ### Provisioning the Application EC2 Instance (`juice-app-server`)
@@ -826,7 +1001,7 @@ all subsequent operator access flows through Session Manager and the
 instance is targeted by its **instance ID**, not a public IP:
 
 ```text
-juice-app-server  →  i-0a81ff2840891c8f7   (us-east-2)
+juice-app-server  →  i-0a8499a03cd3cf6c4   (us-east-2)
 ```
 
 > Because the deploy job addresses the host by instance ID rather
@@ -868,7 +1043,7 @@ aws ecr get-login-password \
       --password-stdin 991776826356.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 ```
 
-The same call is executed remotely by the `deploy_image` job via
+The same call is executed remotely by the `deploy_test` job via
 SSM &mdash; no `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` is
 exported on the host, written to disk, or stored in the pipeline
 for this purpose. The IAM role *is* the credential.
@@ -881,7 +1056,7 @@ for this purpose. The IAM role *is* the credential.
 
 ### Verifying the Deployed Container
 
-Once the pipeline's `deploy_image` job has completed at least once, the
+Once the pipeline's `deploy_test` job has completed at least once, the
 host runs a container named `juice-shop` published on port 3000.
 
 > :warning: **The Security Group must allow TCP 3000 inbound from
