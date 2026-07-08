@@ -176,14 +176,14 @@ jobs:
           IMAGE_NAME="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop"
           LOG_IN_CMD="export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}; aws ecr get-login-password | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
           COMMAND_TO_EXECUTE="docker pull ${IMAGE_NAME}:latest && (docker stop juice-shop || true) && (docker rm juice-shop || true) && docker run -d --name juice-shop -p 3000:3000 ${IMAGE_NAME}:latest"
-          COMMAND_ID=$(aws ssm send-command --instance-ids "i-0d995868b11600e0f" \
+          COMMAND_ID=$(aws ssm send-command --instance-ids "i-0a8499a03cd3cf6c4" \
           --document-name "AWS-RunShellScript" \
           --parameters "commands=[$LOG_IN_CMD, $COMMAND_TO_EXECUTE]" \
           --query "Command.CommandId" --output text)
           sleep 15
           aws ssm get-command-invocation \
           --command-id "$COMMAND_ID" \
-          --instance-id "i-0d995868b11600e0f"
+          --instance-id "i-0a8499a03cd3cf6c4"
           
   zap_baseline:
     runs-on: [self-hosted, juice-shop]
@@ -191,7 +191,7 @@ jobs:
     container:
       image: ghcr.io/zaproxy/zaproxy:stable
     env:
-      ZAP_TARGET: "http://35.183.101.126:3000"
+      ZAP_TARGET: "http://99.79.50.134:3000"
     steps:
       - uses: actions/checkout@v4
       - name: Prepare ZAP workspace
@@ -213,7 +213,7 @@ jobs:
     container:
       image: ghcr.io/zaproxy/zaproxy:stable
     env:
-      ZAP_TARGET: "http://35.183.101.126:3000"
+      ZAP_TARGET: "http://99.79.50.134:3000"
     steps:
       - uses: actions/checkout@v4
       - name: Prepare ZAP workspace
