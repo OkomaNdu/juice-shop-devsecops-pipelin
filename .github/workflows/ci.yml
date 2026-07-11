@@ -6,6 +6,7 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
   IMAGE_NAME: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
+  APP_URL: "3.96.192.165"
 
 
 jobs:
@@ -133,6 +134,12 @@ jobs:
         run: echo "IMAGE_NAME=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop" >> $GITHUB_ENV
       - name: Log in to ECR
         run: aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - name: Reclaim disk space on runner
+        run: |
+          df -h /
+          docker system prune -af
+          docker builder prune -af
+          df -h /
       - run: docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
       - run: docker push $IMAGE_NAME:${{ github.sha }}
       - run: docker push $IMAGE_NAME:latest
@@ -176,14 +183,14 @@ jobs:
           IMAGE_NAME="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop"
           LOG_IN_CMD="export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}; aws ecr get-login-password | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
           COMMAND_TO_EXECUTE="docker pull ${IMAGE_NAME}:latest && (docker stop juice-shop || true) && (docker rm juice-shop || true) && docker run -d --name juice-shop -p 3000:3000 ${IMAGE_NAME}:latest"
-          COMMAND_ID=$(aws ssm send-command --instance-ids "i-0893e3e6d36ed1078" \
+          COMMAND_ID=$(aws ssm send-command --instance-ids "i-060c4d2c872ce9504" \
           --document-name "AWS-RunShellScript" \
           --parameters "commands=[$LOG_IN_CMD, $COMMAND_TO_EXECUTE]" \
           --query "Command.CommandId" --output text)
           sleep 15
           aws ssm get-command-invocation \
           --command-id "$COMMAND_ID" \
-          --instance-id "i-0893e3e6d36ed1078"
+          --instance-id "i-060c4d2c872ce9504"
           
   zap_baseline:
     runs-on: [self-hosted, juice-shop]
@@ -191,7 +198,7 @@ jobs:
     container:
       image: ghcr.io/zaproxy/zaproxy:stable
     env:
-      ZAP_TARGET: "http://99.79.196.143:3000"
+      ZAP_TARGET: "http://$APP_URL:3000"
     steps:
       - uses: actions/checkout@v4
       - name: Prepare ZAP workspace
@@ -213,7 +220,7 @@ jobs:
     container:
       image: ghcr.io/zaproxy/zaproxy:stable
     env:
-      ZAP_TARGET: "http://99.79.50.134:3000"
+      ZAP_TARGET: "http://$APP_URL:3000"
     steps:
       - uses: actions/checkout@v4
       - name: Prepare ZAP workspace
